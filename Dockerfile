@@ -1,10 +1,13 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/azure-functions/python:4-python3.11
 
-WORKDIR /app
+ENV AzureWebJobsScriptRoot=/home/site/wwwroot \
+    AzureFunctionsJobHost__Logging__Console__IsEnabled=true
 
-COPY requirements.txt ./
+WORKDIR /home/site/wwwroot
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY host.json .
+COPY function_app.py .
 COPY app ./app
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
