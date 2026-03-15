@@ -1,0 +1,2 @@
+APP_NAME = "HubSpot Loader"
+DEFAULT_PAGE_SIZE = 100
