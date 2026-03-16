@@ -100,6 +100,8 @@ class HubSpotClient:
                     resp.raise_for_status()
                     return await resp.json()
 
+            except aiohttp.ClientResponseError:
+                raise
             except aiohttp.ClientError as exc:
                 if attempt == _MAX_RETRIES:
                     raise

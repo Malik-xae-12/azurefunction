@@ -1,4 +1,4 @@
-"""HubSpot load service logic."""
+"""HubSpot load service logic - AZURE FUNCTIONS READY."""
 
 import asyncio
 import json
@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from typing import AsyncGenerator, Dict, Iterable, List, Optional
 
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -26,168 +26,139 @@ logger = logging.getLogger(__name__)
 
 _jobs: Dict[str, LoadProgress] = {}
 
-
 async def start_load(
-    background_tasks: BackgroundTasks,
     hubspot_token: str,
     deal_properties: str,
     contact_properties: str,
     company_properties: str,
-):
+) -> StreamingResponse:
+    """
+    🚀 MAIN ENTRY POINT - Runs FULL HubSpot sync with LIVE streaming progress
+    NO BackgroundTasks - Works perfectly in Azure Functions!
+    """
     job_id = f"load_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
-    _jobs[job_id] = LoadProgress(job_id=job_id, status=LoadStatus.RUNNING)
-
+    
+    # 1. Create DB job record FIRST
     db = SessionLocal()
     try:
         create_job(db, job_id=job_id, started_at=datetime.utcnow())
     finally:
         db.close()
-
+    
+    # 2. Initialize progress tracking
+    progress = LoadProgress(job_id=job_id, status=LoadStatus.RUNNING)
+    _jobs[job_id] = progress
+    
+    # 3. Create HubSpot orchestrator
     client = HubSpotClient(access_token=hubspot_token)
     orchestrator = LoadOrchestrator(client=client)
-
-    background_tasks.add_task(
-        _run_load_job,
-        job_id=job_id,
-        orchestrator=orchestrator,
-        deal_props=deal_properties.split(","),
-        contact_props=contact_properties.split(","),
-        company_props=company_properties.split(","),
+    
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            # 🔥 STREAM LIVE PROGRESS - Phase 1→4 updates
+            async for update in orchestrator.run(
+                deal_properties=deal_properties.split(","),
+                contact_properties=contact_properties.split(","),
+                company_properties=company_properties.split(","),
+            ):
+                # Update progress object
+                progress.deals_fetched = update.deals_fetched
+                progress.contacts_fetched = update.contacts_fetched
+                progress.companies_fetched = update.companies_fetched
+                progress.attachments_fetched = update.attachments_fetched
+                progress.pages_processed = update.pages_processed
+                progress.api_calls_made = update.api_calls_made
+                progress.errors = update.errors
+                progress.result_sample = update.result_sample
+                
+                # Persist to database
+                db = SessionLocal()
+                try:
+                    update_job_from_progress(db, job_id=job_id, progress=progress)
+                finally:
+                    db.close()
+                
+                # STREAM to browser/Postman
+                yield f"data: {progress.model_dump_json()}\n\n"
+                logger.info(f"[{job_id}] Progress: {progress.deals_fetched} deals, {progress.api_calls_made} API calls")
+            
+            # Mark as COMPLETED
+            progress.status = LoadStatus.COMPLETED
+            progress.completed_at = datetime.utcnow().isoformat()
+            
+            # Final save + persist ALL data
+            db = SessionLocal()
+            try:
+                update_job_from_progress(db, job_id=job_id, progress=progress)
+                result_data = orchestrator.get_result_data()
+                if result_data:
+                    persist_load_data(db, **result_data)
+            finally:
+                db.close()
+            
+            yield f"data: {progress.model_dump_json()}\n\n"
+            logger.info(f"[{job_id}] ✅ COMPLETED - {progress.deals_fetched} deals processed")
+            
+        except Exception as exc:
+            logger.exception(f"[{job_id}] ❌ FAILED")
+            progress.status = LoadStatus.FAILED
+            progress.error = str(exc)
+            progress.completed_at = datetime.utcnow().isoformat()
+            
+            db = SessionLocal()
+            try:
+                update_job_from_progress(db, job_id=job_id, progress=progress)
+            finally:
+                db.close()
+            
+            yield f"data: {progress.model_dump_json()}\n\n"
+        finally:
+            # Cleanup
+            if job_id in _jobs:
+                del _jobs[job_id]
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        }
     )
 
-    return {
-        "job_id": job_id,
-        "status": "started",
-        "poll_url": f"/load/status/{job_id}",
-        "stream_url": f"/load/stream/{job_id}",
-        "result_url": f"/load/result/{job_id}",
-    }
-
-
 async def get_status(job_id: str) -> LoadProgress:
-    prog = _jobs.get(job_id)
-    if prog:
-        return prog
-
+    """📊 Check job status - memory cache → DB fallback"""
+    if job_id in _jobs:
+        return _jobs[job_id]
+    
     db = SessionLocal()
     try:
         db_prog = get_job_progress(db, job_id)
+        if not db_prog:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return db_prog
     finally:
         db.close()
 
-    if not db_prog:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return db_prog
-
-
-async def stream_progress(job_id: str) -> StreamingResponse:
-    if job_id not in _jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    async def event_gen() -> AsyncGenerator[str, None]:
-        last_count = -1
-        while True:
-            prog = _jobs.get(job_id)
-            if prog is None:
-                db = SessionLocal()
-                try:
-                    prog = get_job_progress(db, job_id)
-                finally:
-                    db.close()
-                if prog is None:
-                    break
-            if prog.deals_fetched != last_count:
-                last_count = prog.deals_fetched
-                yield f"data: {prog.model_dump_json()}\n\n"
-            if prog.status in (LoadStatus.COMPLETED, LoadStatus.FAILED):
-                yield f"data: {prog.model_dump_json()}\n\n"
-                break
-            await asyncio.sleep(1)
-
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-
 async def get_result(job_id: str) -> LoadProgress:
-    prog = _jobs.get(job_id)
-    if not prog:
-        db = SessionLocal()
-        try:
-            prog = get_job_progress(db, job_id)
-        finally:
-            db.close()
-    if not prog:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if prog.status == LoadStatus.RUNNING:
-        raise HTTPException(status_code=202, detail="Job still running — keep polling /load/status")
-    if prog.status == LoadStatus.FAILED:
-        raise HTTPException(status_code=500, detail=prog.error)
-    return prog
+    """✅ Get completed job result"""
+    progress = await get_status(job_id)
+    if progress.status == LoadStatus.RUNNING:
+        raise HTTPException(status_code=202, detail="Job still running - use /load/status")
+    if progress.status == LoadStatus.FAILED:
+        raise HTTPException(status_code=500, detail=progress.error)
+    return progress
 
-
-async def _run_load_job(
-    job_id: str,
-    orchestrator: LoadOrchestrator,
-    deal_props: list,
-    contact_props: list,
-    company_props: list,
-):
-    prog = _jobs[job_id]
-    try:
-        async for update in orchestrator.run(
-            deal_properties=deal_props,
-            contact_properties=contact_props,
-            company_properties=company_props,
-        ):
-            prog.deals_fetched = update.deals_fetched
-            prog.contacts_fetched = update.contacts_fetched
-            prog.companies_fetched = update.companies_fetched
-            prog.attachments_fetched = update.attachments_fetched
-            prog.pages_processed = update.pages_processed
-            prog.api_calls_made = update.api_calls_made
-            prog.errors = update.errors
-            prog.result_sample = update.result_sample
-
-            db = SessionLocal()
-            try:
-                update_job_from_progress(db, job_id=job_id, progress=prog)
-            finally:
-                db.close()
-
-        prog.status = LoadStatus.COMPLETED
-        prog.completed_at = datetime.utcnow().isoformat()
-        db = SessionLocal()
-        try:
-            update_job_from_progress(db, job_id=job_id, progress=prog)
-            result_data = orchestrator.get_result_data()
-            if result_data:
-                persist_load_data(db, **result_data)
-        finally:
-            db.close()
-
-        logger.info(
-            f"[{job_id}] DONE — {prog.deals_fetched} deals, "
-            f"{prog.contacts_fetched} contacts, {prog.companies_fetched} companies, "
-            f"{prog.attachments_fetched} attachments"
-        )
-
-    except Exception as exc:
-        logger.exception(f"[{job_id}] Load failed: {exc}")
-        prog.status = LoadStatus.FAILED
-        prog.error = str(exc)
-        prog.completed_at = datetime.utcnow().isoformat()
-        db = SessionLocal()
-        try:
-            update_job_from_progress(db, job_id=job_id, progress=prog)
-        finally:
-            db.close()
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALL YOUR EXISTING DATABASE FUNCTIONS - UNCHANGED
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def create_job(db: Session, job_id: str, started_at: datetime) -> Job:
     job = Job(job_id=job_id, status=LoadStatus.RUNNING.value, started_at=started_at)
     db.add(job)
     db.commit()
     return job
-
 
 def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -> Job:
     job = db.execute(select(Job).where(Job.job_id == job_id)).scalar_one_or_none()
@@ -211,7 +182,6 @@ def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -
 
     db.commit()
     return job
-
 
 def get_job_progress(db: Session, job_id: str) -> Optional[LoadProgress]:
     job = db.execute(select(Job).where(Job.job_id == job_id)).scalar_one_or_none()
@@ -237,7 +207,6 @@ def get_job_progress(db: Session, job_id: str) -> Optional[LoadProgress]:
         result_sample=result_sample,
     )
 
-
 def persist_load_data(
     db: Session,
     deals: List[Dict],
@@ -254,7 +223,6 @@ def persist_load_data(
     _replace_deal_companies(db, company_assoc)
     _replace_attachments(db, attachments_map)
     db.commit()
-
 
 def _upsert_deals(db: Session, deals: Iterable[Dict]) -> None:
     for deal in deals:
@@ -275,7 +243,6 @@ def _upsert_deals(db: Session, deals: Iterable[Dict]) -> None:
             )
         )
 
-
 def _upsert_contacts(db: Session, contacts_map: Dict[str, Dict]) -> None:
     for contact_id, props in contacts_map.items():
         cid = str(contact_id)
@@ -291,7 +258,6 @@ def _upsert_contacts(db: Session, contacts_map: Dict[str, Dict]) -> None:
                 lastmodifieddate=_get_prop(props, "lastmodifieddate"),
             )
         )
-
 
 def _upsert_companies(db: Session, companies_map: Dict[str, Dict]) -> None:
     for company_id, props in companies_map.items():
@@ -309,7 +275,6 @@ def _upsert_companies(db: Session, companies_map: Dict[str, Dict]) -> None:
             )
         )
 
-
 def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> None:
     deal_ids = list(contact_assoc.keys())
     for chunk in _chunk_list(deal_ids, 500):
@@ -321,7 +286,6 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
             rows.append(DealContact(deal_id=str(deal_id), contact_id=str(contact_id)))
     db.add_all(rows)
 
-
 def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) -> None:
     deal_ids = list(company_assoc.keys())
     for chunk in _chunk_list(deal_ids, 500):
@@ -332,7 +296,6 @@ def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) ->
         for company_id in company_ids:
             rows.append(DealCompany(deal_id=str(deal_id), company_id=str(company_id)))
     db.add_all(rows)
-
 
 def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
     deal_ids = list(attachments_map.keys())
@@ -351,10 +314,8 @@ def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
             )
     db.add_all(rows)
 
-
 def _chunk_list(items: List[str], size: int) -> List[List[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
-
 
 def _get_prop(props: Dict, key: str) -> Optional[str]:
     value = props.get(key)
