@@ -170,3 +170,10 @@ class HubSpotClient:
             f"/crm/v3/objects/notes/{engagement_id}",
             params={"properties": "hs_attachment_ids,hs_note_body"},
         )
+
+    async def get_pipeline_stages(self, pipeline_id: str) -> Dict:
+        """GET /crm/v3/pipelines/deals/{pipeline_id}/stages"""
+        return await self._request(
+            "GET",
+            f"/crm/v3/pipelines/deals/{pipeline_id}/stages",
+        )

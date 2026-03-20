@@ -215,8 +215,9 @@ def persist_load_data(
     contacts_map: Dict[str, Dict],
     companies_map: Dict[str, Dict],
     attachments_map: Dict[str, List],
+    stage_map: Dict[str, str], 
 ) -> None:
-    _upsert_deals(db, deals)
+    _upsert_deals(db, deals, stage_map)
     _upsert_contacts(db, contacts_map)
     _upsert_companies(db, companies_map)
     _replace_deal_contacts(db, contact_assoc)
@@ -224,22 +225,29 @@ def persist_load_data(
     _replace_attachments(db, attachments_map)
     db.commit()
 
-def _upsert_deals(db: Session, deals: Iterable[Dict]) -> None:
+def _upsert_deals(db: Session, deals: Iterable[Dict], stage_map: Dict[str, str]) -> None:
     for deal in deals:
         props = deal.get("properties", {})
         deal_id = str(deal.get("id", ""))
+        stage_id = _get_prop(props, "dealstage") or ""
         db.merge(
             Deal(
                 id=deal_id,
                 hs_object_id=_get_prop(props, "hs_object_id") or deal_id,
                 dealname=_get_prop(props, "dealname"),
                 amount=_get_prop(props, "amount"),
-                dealstage=_get_prop(props, "dealstage"),
+                dealstage=stage_id,
+                dealstage_label=stage_map.get(stage_id),  
                 closedate=_get_prop(props, "closedate"),
                 createdate=_get_prop(props, "createdate"),
                 hs_lastmodifieddate=_get_prop(props, "hs_lastmodifieddate"),
                 hubspot_owner_id=_get_prop(props, "hubspot_owner_id"),
                 pipeline=_get_prop(props, "pipeline"),
+                deal_owner_email=_get_prop(props, "deal_owner_email"),
+                delivery_owner=_get_prop(props, "delivery_owner"),
+                project_start_date=_get_prop(props, "project_start_date"),
+                project_end_date=_get_prop(props, "project_end_date"),
+                po_hours=_get_prop(props, "po_hours"),
             )
         )
 

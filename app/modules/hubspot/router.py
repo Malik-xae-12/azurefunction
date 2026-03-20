@@ -3,10 +3,13 @@ from app.modules.hubspot import service
 
 router = APIRouter(prefix="/hubspot")  
 
-@router.post("/load/start", summary="🚀 Start HubSpot sync (streams LIVE progress)")
+@router.post("/load/start", summary="Start HubSpot sync (streams LIVE progress)")
 async def start_load(
     hubspot_token: str,
-    deal_properties: str = Query("dealname,amount,dealstage,closedate,pipeline,hubspot_owner_id"),
+    deal_properties: str = Query(
+        "dealname,amount,dealstage,closedate,pipeline,hubspot_owner_id,"
+        "deal_owner_email,delivery_owner,project_start_date,project_end_date,po_hours"
+    ),
     contact_properties: str = Query("firstname,lastname,email,phone"),
     company_properties: str = Query("name,domain,industry,city"),
 ):

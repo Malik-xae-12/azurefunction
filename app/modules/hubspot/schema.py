@@ -29,14 +29,3 @@ class LoadProgress(BaseModel):
         default_factory=list,
         description="First 3 enriched deals as a preview"
     )
-
-
-class LoadResult(BaseModel):
-    job_id: str
-    total_deals: int
-    total_contacts: int
-    total_companies: int
-    total_attachments: int
-    api_calls_made: int
-    errors: List[str]
-    completed_at: str

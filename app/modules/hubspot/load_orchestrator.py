@@ -51,6 +51,10 @@ class LoadOrchestrator:
 
             logger.info(f"Phase 1 complete: {len(all_deals)} deals fetched")
 
+            # ── Phase 2.5: Fetch stage label map ─────────────────────────
+            stage_map = await self._fetch_stage_map("79964941")
+            logger.info(f"Stage map loaded: {len(stage_map)} stages")
+
             # ── Phase 2: Batch-fetch associations ─────────────────────────────
             contact_assoc, company_assoc = await asyncio.gather(
                 self._batch_associations("deals", "contacts", all_deal_ids),
@@ -98,6 +102,7 @@ class LoadOrchestrator:
                 contacts_map=contacts_map,
                 companies_map=companies_map,
                 attachments_map=attachments_map,
+                stage_map=stage_map,   
             )
 
             self._progress.result_sample = enriched_deals[:3]
@@ -109,6 +114,7 @@ class LoadOrchestrator:
                 "contacts_map": contacts_map,
                 "companies_map": companies_map,
                 "attachments_map": attachments_map,
+                 "stage_map": stage_map, 
             }
             yield self._progress
 
@@ -211,6 +217,12 @@ class LoadOrchestrator:
         attachment_ids = [a.strip() for a in attachment_ids_raw.split(";") if a.strip()]
         return [{"deal_id": deal_id, "note_id": note_id, "file_id": fid} for fid in attachment_ids]
 
+    async def _fetch_stage_map(self, pipeline_id: str) -> Dict[str, str]:
+        """Returns {stage_id: stage_label}"""
+        data = await self.client.get_pipeline_stages(pipeline_id)
+        self._progress.api_calls_made += 1
+        return {stage["id"]: stage["label"] for stage in data.get("results", [])}
+
     def _enrich_deals(
         self,
         deals: List[Dict],
@@ -219,13 +231,21 @@ class LoadOrchestrator:
         contacts_map: Dict[str, Dict],
         companies_map: Dict[str, Dict],
         attachments_map: Dict[str, List],
+        stage_map: Dict[str, str],    # ← add this
     ) -> List[Dict]:
         enriched = []
         for deal in deals:
             did = deal["id"]
+            props = deal.get("properties", {})
+            stage_id = props.get("dealstage", "")
+
             enriched.append({
                 "id": did,
-                "properties": deal.get("properties", {}),
+                "properties": {
+                    **props,
+                    "dealstage_id": stage_id,
+                    "dealstage_label": stage_map.get(stage_id, stage_id),  # fallback to raw id if not found
+                },
                 "contacts": [
                     {"id": cid, "properties": contacts_map.get(cid, {})}
                     for cid in contact_assoc.get(did, [])
