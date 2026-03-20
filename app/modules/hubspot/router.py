@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Query
 from app.modules.hubspot import service
+from typing import List
+from app.modules.hubspot.schema import HubSpotWebhookEvent
 
 router = APIRouter(prefix="/hubspot")  
 
@@ -32,3 +34,16 @@ async def get_result(job_id: str):
 @router.get("/", summary="Health check")
 async def root():
     return {"status": "ok", "service": "HubSpot Loader", "docs": "/hubspot/docs"}
+
+
+@router.post("/webhook", summary="Receive HubSpot webhook events")
+async def hubspot_webhook(
+    events: List[HubSpotWebhookEvent],
+    hubspot_token: str = Query(..., description="HubSpot private app token"),
+):
+    """
+    Receives deal.creation, deal.deletion, deal.propertyChange events.
+    Updates local DB accordingly.
+    """
+    result = await service.handle_webhook(events, hubspot_token)
+    return result

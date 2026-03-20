@@ -20,7 +20,7 @@ from app.db.models.hubspot.job import Job
 from app.db.session import SessionLocal
 from app.modules.hubspot.hubspot_client import HubSpotClient
 from app.modules.hubspot.load_orchestrator import LoadOrchestrator
-from app.modules.hubspot.schema import LoadProgress, LoadStatus
+from app.modules.hubspot.schema import LoadProgress, LoadStatus, HubSpotWebhookEvent
 
 logger = logging.getLogger(__name__)
 
@@ -330,3 +330,82 @@ def _get_prop(props: Dict, key: str) -> Optional[str]:
     if value is None:
         return None
     return str(value)
+
+async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) -> Dict:
+    """Process incoming HubSpot webhook events and sync DB."""
+    processed = 0
+    errors = []
+
+    for event in events:
+        try:
+            deal_id = str(event.objectId)
+            sub_type = event.subscriptionType
+
+            if sub_type == "deal.deletion":
+                # Delete deal from DB
+                db = SessionLocal()
+                try:
+                    _delete_deal(db, deal_id)
+                finally:
+                    db.close()
+
+            elif sub_type in ("deal.creation", "deal.propertyChange"):
+                # Fetch fresh deal data from HubSpot and upsert
+                client = HubSpotClient(access_token=hubspot_token)
+                try:
+                    deal_data = await _fetch_single_deal(client, deal_id)
+                    if deal_data:
+                        stage_map = await _get_stage_map(client)
+                        db = SessionLocal()
+                        try:
+                            _upsert_deals(db, [deal_data], stage_map)
+                            db.commit()
+                        finally:
+                            db.close()
+                finally:
+                    await client.close()
+
+            processed += 1
+            logger.info(f"Webhook processed: {sub_type} for deal {deal_id}")
+
+        except Exception as exc:
+            logger.error(f"Webhook error for event {event.eventId}: {exc}")
+            errors.append(str(exc))
+
+    return {"processed": processed, "errors": errors}
+
+
+async def _fetch_single_deal(client: HubSpotClient, deal_id: str) -> Optional[Dict]:
+    """Fetch a single deal by ID with all required properties."""
+    properties = [
+        "dealname", "amount", "dealstage", "closedate", "pipeline",
+        "hubspot_owner_id", "deal_owner_email", "delivery_owner",
+        "project_start_date", "project_end_date", "po_hours",
+        "createdate", "hs_lastmodifieddate", "hs_object_id"
+    ]
+    try:
+        data = await client.batch_read_objects("deals", [deal_id], properties)
+        results = data.get("results", [])
+        if results:
+            return results[0]
+    except Exception as exc:
+        logger.error(f"Failed to fetch deal {deal_id}: {exc}")
+    return None
+
+
+async def _get_stage_map(client: HubSpotClient) -> Dict[str, str]:
+    """Fetch stage map for label resolution."""
+    data = await client.get_pipeline_stages("79964941")
+    return {stage["id"]: stage["label"] for stage in data.get("results", [])}
+
+
+def _delete_deal(db: Session, deal_id: str) -> None:
+    """Remove deal and its associations from DB."""
+    db.execute(delete(DealContact).where(DealContact.deal_id == deal_id))
+    db.execute(delete(DealCompany).where(DealCompany.deal_id == deal_id))
+    db.execute(delete(Attachment).where(Attachment.deal_id == deal_id))
+    deal = db.execute(select(Deal).where(Deal.id == deal_id)).scalar_one_or_none()
+    if deal:
+        db.delete(deal)
+    db.commit()
+    logger.info(f"Deal {deal_id} deleted from DB")

@@ -29,3 +29,18 @@ class LoadProgress(BaseModel):
         default_factory=list,
         description="First 3 enriched deals as a preview"
     )
+
+
+class HubSpotWebhookEvent(BaseModel):
+    appId: int
+    eventId: int
+    subscriptionId: int
+    portalId: int
+    occurredAt: float
+    subscriptionType: str  
+    attemptNumber: int
+    objectId: int
+    changeSource: Optional[str] = None
+    propertyName: Optional[str] = None  
+    propertyValue: Optional[str] = None     
+    changeFlag: Optional[str] = None  
