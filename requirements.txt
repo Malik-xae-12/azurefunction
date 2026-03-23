@@ -40,6 +40,7 @@ rich-toolkit==0.19.7
 rignore==0.7.6
 sentry-sdk==2.54.0
 shellingham==1.5.4
+psycopg2-binary==2.9.10
 SQLAlchemy==2.0.48
 sqlmodel==0.0.37
 starlette==0.52.1

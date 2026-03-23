@@ -175,5 +175,5 @@ class HubSpotClient:
         """GET /crm/v3/pipelines/deals/{pipeline_id}/stages"""
         return await self._request(
             "GET",
-            f"/crm/v3/pipelines/deals/{pipeline_id}/stages",
+            f"/crm/v3/pipelines/deals/default/stages",
         )
