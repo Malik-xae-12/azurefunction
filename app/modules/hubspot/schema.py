@@ -37,10 +37,11 @@ class HubSpotWebhookEvent(BaseModel):
     subscriptionId: int
     portalId: int
     occurredAt: float
-    subscriptionType: str  
+    subscriptionType: str
     attemptNumber: int
     objectId: int
+    objectType: Optional[str] = None     
     changeSource: Optional[str] = None
-    propertyName: Optional[str] = None  
-    propertyValue: Optional[str] = None     
-    changeFlag: Optional[str] = None  
+    propertyName: Optional[str] = None
+    propertyValue: Optional[str] = None
+    changeFlag: Optional[str] = None    

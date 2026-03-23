@@ -20,3 +20,7 @@ class Deal(Base):
     project_start_date = Column(String, nullable=True)
     project_end_date = Column(String, nullable=True)
     po_hours = Column(String, nullable=True)
+
+
+
+#deal type,deal description

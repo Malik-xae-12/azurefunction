@@ -3,7 +3,8 @@ from app.modules.hubspot import service
 from typing import List
 from app.modules.hubspot.schema import HubSpotWebhookEvent
 
-router = APIRouter(prefix="/hubspot")  
+router = APIRouter(prefix="/hubspot")
+
 
 @router.post("/load/start", summary="Start HubSpot sync (streams LIVE progress)")
 async def start_load(
@@ -23,13 +24,16 @@ async def start_load(
         company_properties=company_properties,
     )
 
-@router.get("/load/status/{job_id}", summary="📊 Check job status")
+
+@router.get("/load/status/{job_id}", summary="Check job status")
 async def get_status(job_id: str):
     return await service.get_status(job_id)
 
-@router.get("/load/result/{job_id}", summary="✅ Get completed results")
+
+@router.get("/load/result/{job_id}", summary="Get completed results")
 async def get_result(job_id: str):
     return await service.get_result(job_id)
+
 
 @router.get("/", summary="Health check")
 async def root():
@@ -42,7 +46,7 @@ async def hubspot_webhook(
     hubspot_token: str = Query(..., description="HubSpot private app token"),
 ):
     """
-    Receives deal.creation, deal.deletion, deal.propertyChange events.
+    Receives deal, contact, and company create/update/delete/association events.
     Updates local DB accordingly.
     """
     result = await service.handle_webhook(events, hubspot_token)
