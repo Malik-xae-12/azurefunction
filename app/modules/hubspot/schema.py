@@ -1,10 +1,15 @@
-"""Pydantic models for request/response schemas."""
+"""Pydantic schemas — HubSpot webhook events and load progress."""
 
-from enum import Enum
-from typing import Any, List, Optional
-from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOAD JOB
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class LoadStatus(str, Enum):
     RUNNING = "running"
@@ -25,23 +30,58 @@ class LoadProgress(BaseModel):
     error: Optional[str] = None
     started_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     completed_at: Optional[str] = None
-    result_sample: List[dict] = Field(
+    result_sample: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="First 3 enriched deals as a preview"
+        description="First 3 enriched deals as a preview",
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HUBSPOT WEBHOOK EVENT (v3 Private App webhooks)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class HubSpotWebhookEvent(BaseModel):
+    """
+    Represents a single v3 HubSpot webhook event.
+
+    Subscription types handled:
+        deal.creation
+        deal.propertyChange      → propertyName / propertyValue populated
+        deal.deletion
+        deal.associationChange   → associationType / fromObjectId / toObjectId / associationRemoved
+
+        contact.creation
+        contact.propertyChange
+        contact.deletion
+        contact.associationChange
+
+        company.creation
+        company.propertyChange
+        company.deletion
+        company.associationChange
+
+    Reference: https://developers.hubspot.com/docs/api/webhooks
+    """
+
+    # Always present
     appId: int
     eventId: int
     subscriptionId: int
     portalId: int
-    occurredAt: float
-    subscriptionType: str
+    occurredAt: float           # epoch milliseconds
+    subscriptionType: str       # e.g. "deal.creation"
     attemptNumber: int
-    objectId: int
-    objectType: Optional[str] = None     
+    objectId: int               # HubSpot object ID (deal / contact / company)
+
+    # Property change events
     changeSource: Optional[str] = None
-    propertyName: Optional[str] = None
-    propertyValue: Optional[str] = None
-    changeFlag: Optional[str] = None    
+    propertyName: Optional[str] = None      # e.g. "dealname", "amount", "dealstage"
+    propertyValue: Optional[str] = None     # new value (string)
+
+    # Association change events
+    changeFlag: Optional[str] = None        # "CREATED" | "DELETED"
+    associationType: Optional[str] = None   # e.g. "DEAL_TO_CONTACT"
+    fromObjectId: Optional[int] = None
+    toObjectId: Optional[int] = None
+    associationRemoved: Optional[bool] = None
+    isPrimaryAssociation: Optional[bool] = None

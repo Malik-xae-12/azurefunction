@@ -1,3 +1,5 @@
+"""FastAPI dependency — yields a SQLAlchemy DB session."""
+
 from collections.abc import Generator
 
 from app.db.session import SessionLocal
