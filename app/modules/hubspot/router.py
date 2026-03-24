@@ -1,9 +1,10 @@
 """HubSpot API router."""
 
 import logging
+import os
 from typing import List
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.core.security import verify_hubspot_signature
 from app.modules.hubspot import service
@@ -20,11 +21,6 @@ router = APIRouter(prefix="/hubspot", tags=["HubSpot"])
 
 @router.post("/load/start", summary="Start full HubSpot sync (streams live SSE progress)")
 async def start_load(
-    hubspot_token: str = Header(
-        ...,
-        alias="x-hubspot-token",
-        description="HubSpot Private App access token — never put secrets in query params",
-    ),
     deal_properties: str = Query(
         default=(
             "dealname,amount,dealstage,closedate,pipeline,hubspot_owner_id,"
@@ -44,8 +40,14 @@ async def start_load(
 ):
     """
     Runs a full HubSpot sync and streams live progress as Server-Sent Events.
-    Azure Functions safe — uses async generator, no BackgroundTasks.
+    HubSpot access token is read from HUBSPOT_ACCESS_TOKEN env var.
     """
+    hubspot_token = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
+    if not hubspot_token:
+        raise HTTPException(
+            status_code=500,
+            detail="HUBSPOT_ACCESS_TOKEN env var is not set.",
+        )
     return await service.start_load(
         hubspot_token=hubspot_token,
         deal_properties=deal_properties,
@@ -79,11 +81,6 @@ async def get_result(job_id: str):
 async def hubspot_webhook(
     request: Request,
     events: List[HubSpotWebhookEvent],
-    hubspot_token: str = Header(
-        ...,
-        alias="x-hubspot-token",
-        description="HubSpot Private App access token — needed to fetch updated records",
-    ),
 ):
     """
     Receives and processes HubSpot v3 webhook events.
@@ -98,7 +95,14 @@ async def hubspot_webhook(
       - associationRemoved=True  → row soft-deleted (deleted_at set, row kept for audit)
 
     Signature is validated before this handler runs (via Depends).
+    HubSpot access token is read from HUBSPOT_ACCESS_TOKEN env var.
     """
+    hubspot_token = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
+    if not hubspot_token:
+        raise HTTPException(
+            status_code=500,
+            detail="HUBSPOT_ACCESS_TOKEN env var is not set.",
+        )
     result = await service.handle_webhook(events, hubspot_token)
     return result
 
