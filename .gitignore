@@ -1,1 +1,59 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+*.manifest
+*.spec
+
+# Virtual environments
 .env
+.venv/
+env/
+venv/
+ENV/
+
+# FastAPI / Uvicorn logs
+*.log
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+
+# Testing and coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# Build and distribution
+build/
+dist/
+*.bak
+*.tmp
+
+# Database and migrations
+*.db
+*.sqlite3
+alembic/versions/
+
+# Environment variables
+.env.local
+.env.dev
+.env.test
+.env.prod
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
