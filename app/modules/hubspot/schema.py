@@ -61,6 +61,10 @@ class HubSpotWebhookEvent(BaseModel):
         company.associationChange
 
     Reference: https://developers.hubspot.com/docs/api/webhooks
+
+    NOTE: objectId is absent on associationChange events — those carry
+    fromObjectId / toObjectId instead.  Making it Optional prevents the
+    422 Unprocessable Content that was crashing every association webhook.
     """
 
     # Always present
@@ -71,15 +75,19 @@ class HubSpotWebhookEvent(BaseModel):
     occurredAt: float           # epoch milliseconds
     subscriptionType: str       # e.g. "deal.creation"
     attemptNumber: int
-    objectId: int               # HubSpot object ID (deal / contact / company)
+
+    # FIX: was `int` (required) — associationChange events omit this field entirely,
+    # which caused Pydantic to reject the whole request with 422 before any handler ran.
+    objectId: Optional[int] = None
 
     # Property change events
     changeSource: Optional[str] = None
+    sourceId: Optional[str] = None          # FIX: was missing — HubSpot sends on every event
     propertyName: Optional[str] = None      # e.g. "dealname", "amount", "dealstage"
     propertyValue: Optional[str] = None     # new value (string)
 
     # Association change events
-    changeFlag: Optional[str] = None        # "CREATED" | "DELETED"
+    changeFlag: Optional[str] = None        # "CREATED" | "DELETED" (older format)
     associationType: Optional[str] = None   # e.g. "DEAL_TO_CONTACT"
     fromObjectId: Optional[int] = None
     toObjectId: Optional[int] = None

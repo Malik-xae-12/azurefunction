@@ -104,7 +104,6 @@ def _is_ignored_property(name: Optional[str]) -> bool:
         return False
     if name in IGNORED_PROPERTIES:
         return True
-    # Ignore any hs_time_in_* property
     if name.startswith("hs_time_in_"):
         return True
     return False
@@ -241,17 +240,45 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
     """
     Process all incoming HubSpot webhook events.
 
-    Association changes (deal.associationChange / contact.associationChange /
-    company.associationChange) are the primary focus:
-      - associationRemoved=False → upsert the association row (created or restored)
-      - associationRemoved=True  → soft-delete the row (set deleted_at)
+    Two optimisations applied before the main loop:
+
+    1. DEDUP — When one user action fires N property/creation events for the
+       same object (e.g. company creation fires 5 events), we only need one
+       API fetch+upsert.  We keep the LAST event per (object_type, objectId)
+       so we always act on the most recent state.
+
+    2. MIRROR SKIP — Association events always arrive in both directions
+       (DEAL_TO_CONTACT + CONTACT_TO_DEAL).  We only process the DEAL_TO_*
+       direction; the mirror is a no-op because the DB row is keyed on
+       (deal_id, contact/company_id).
     """
     processed = 0
     errors: List[str] = []
 
-    for event in events:
+    # ── FIX 1: deduplicate property/creation events per object within batch ──
+    # Keep only the last event per (object_type, objectId).
+    # Deletion and association events are never deduplicated.
+    seen_upsert_keys: set = set()
+    deduped: List[HubSpotWebhookEvent] = []
+
+    for event in reversed(events):
+        sub = event.subscriptionType or ""
+        is_upsert = sub.endswith(".creation") or sub.endswith(".propertyChange")
+        if is_upsert and event.objectId is not None:
+            key = (sub.split(".")[0], event.objectId)   # e.g. ("company", 315089583808)
+            if key in seen_upsert_keys:
+                processed += 1   # count as processed — just skipped
+                continue
+            seen_upsert_keys.add(key)
+        deduped.append(event)
+
+    deduped.reverse()   # restore original chronological order
+
+    for event in deduped:
         try:
-            object_id = str(event.objectId)
+            # objectId is None on associationChange events — use empty string
+            # so existing log lines and soft-delete helpers still work safely.
+            object_id = str(event.objectId) if event.objectId is not None else ""
             sub_type = event.subscriptionType
 
             # Skip noisy system-property events
@@ -370,7 +397,7 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASSOCIATION CHANGE HANDLER — the core of the webhook deal logic
+# ASSOCIATION CHANGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _handle_association_change(
@@ -381,22 +408,28 @@ def _handle_association_change(
     """
     Handle a HubSpot associationChange event.
 
-    HubSpot sends:
-        associationType   : "DEAL_TO_CONTACT" | "CONTACT_TO_DEAL" |
-                            "DEAL_TO_COMPANY"  | "COMPANY_TO_DEAL"
-        fromObjectId      : ID of the source object
-        toObjectId        : ID of the target object
-        associationRemoved: True = remove, False = add/restore
-        isPrimaryAssociation: True = primary
-        changeFlag        : "CREATED" | "DELETED" (older format, may be absent)
+    HubSpot always fires BOTH directions for every association action:
+        DEAL_TO_CONTACT  +  CONTACT_TO_DEAL
+        DEAL_TO_COMPANY  +  COMPANY_TO_DEAL
 
-    We normalise direction so deal_id is always the deal side.
+    FIX 2: We skip the mirror directions (CONTACT_TO_DEAL, COMPANY_TO_DEAL)
+    entirely.  The DB row is keyed on (deal_id, contact/company_id) and the
+    DEAL_TO_* event already carries the correct IDs, so processing the mirror
+    would just write the same row a second time.
     """
     a_type = event.associationType
     if not a_type:
         logger.warning(
             "associationChange event %s has no associationType — skipping",
             event.eventId,
+        )
+        return
+
+    # ── FIX 2: skip mirror-direction events ───────────────────────────────────
+    if a_type in ("CONTACT_TO_DEAL", "COMPANY_TO_DEAL"):
+        logger.debug(
+            "Skipping mirror association event %s (type=%s) — handled by DEAL_TO_ counterpart",
+            event.eventId, a_type,
         )
         return
 
@@ -407,29 +440,21 @@ def _handle_association_change(
     now = datetime.utcnow()
 
     # ── DEAL ↔ CONTACT ────────────────────────────────────────────────────────
-    if a_type in ("DEAL_TO_CONTACT", "CONTACT_TO_DEAL"):
-        if a_type == "DEAL_TO_CONTACT":
-            deal_id, contact_id = from_id, to_id
-        else:
-            deal_id, contact_id = to_id, from_id
+    if a_type == "DEAL_TO_CONTACT":
+        deal_id, contact_id = from_id, to_id
 
         if not deal_id or not contact_id:
             logger.warning("associationChange %s missing IDs — skipping", event.eventId)
             return
 
         if removed:
-            # Soft-delete: mark deleted_at, keep the row for audit trail
             db.execute(
                 update(DealContact)
                 .where(DealContact.deal_id == deal_id, DealContact.contact_id == contact_id)
                 .values(deleted_at=now, updated_at=now, change_source=source)
             )
-            logger.info(
-                "ASSOC REMOVED: deal %s ↔ contact %s (type=%s)",
-                deal_id, contact_id, a_type,
-            )
+            logger.info("ASSOC REMOVED: deal %s ↔ contact %s", deal_id, contact_id)
         else:
-            # Upsert: restore if soft-deleted, create if new
             existing = db.execute(
                 select(DealContact).where(
                     DealContact.deal_id == deal_id,
@@ -455,16 +480,13 @@ def _handle_association_change(
                     deleted_at=None,
                 ))
             logger.info(
-                "ASSOC ADDED/RESTORED: deal %s ↔ contact %s (primary=%s type=%s)",
-                deal_id, contact_id, is_primary, a_type,
+                "ASSOC ADDED/RESTORED: deal %s ↔ contact %s (primary=%s)",
+                deal_id, contact_id, is_primary,
             )
 
     # ── DEAL ↔ COMPANY ────────────────────────────────────────────────────────
-    elif a_type in ("DEAL_TO_COMPANY", "COMPANY_TO_DEAL"):
-        if a_type == "DEAL_TO_COMPANY":
-            deal_id, company_id = from_id, to_id
-        else:
-            deal_id, company_id = to_id, from_id
+    elif a_type == "DEAL_TO_COMPANY":
+        deal_id, company_id = from_id, to_id
 
         if not deal_id or not company_id:
             logger.warning("associationChange %s missing IDs — skipping", event.eventId)
@@ -476,10 +498,7 @@ def _handle_association_change(
                 .where(DealCompany.deal_id == deal_id, DealCompany.company_id == company_id)
                 .values(deleted_at=now, updated_at=now, change_source=source)
             )
-            logger.info(
-                "ASSOC REMOVED: deal %s ↔ company %s (type=%s)",
-                deal_id, company_id, a_type,
-            )
+            logger.info("ASSOC REMOVED: deal %s ↔ company %s", deal_id, company_id)
         else:
             existing = db.execute(
                 select(DealCompany).where(
@@ -506,8 +525,8 @@ def _handle_association_change(
                     deleted_at=None,
                 ))
             logger.info(
-                "ASSOC ADDED/RESTORED: deal %s ↔ company %s (primary=%s type=%s)",
-                deal_id, company_id, is_primary, a_type,
+                "ASSOC ADDED/RESTORED: deal %s ↔ company %s (primary=%s)",
+                deal_id, company_id, is_primary,
             )
 
     else:
@@ -579,7 +598,6 @@ async def _sync_deal_associations(client: HubSpotClient, deal_id: str, source: s
         now = datetime.utcnow()
         db = SessionLocal()
         try:
-            # Soft-delete all existing, then re-add active ones
             db.execute(
                 update(DealContact)
                 .where(DealContact.deal_id == deal_id)
@@ -672,7 +690,7 @@ def _upsert_deals(
                 dealtype=_get_prop(props, "dealtype"),
                 description=_get_prop(props, "description"),
                 synced_at=now,
-                deleted_at=None,    # always restore on upsert
+                deleted_at=None,
             )
         )
 
@@ -737,9 +755,7 @@ def _upsert_companies(
 
 def _soft_delete_deal(db: Session, deal_id: str) -> None:
     now = datetime.utcnow()
-    # Soft-delete the deal itself
     db.execute(update(Deal).where(Deal.id == deal_id).values(deleted_at=now, synced_at=now))
-    # Soft-delete all its association rows too
     db.execute(
         update(DealContact)
         .where(DealContact.deal_id == deal_id)
@@ -802,11 +818,9 @@ def persist_load_data(
 
 
 def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> None:
-    """Replace all deal-contact associations from initial load."""
     deal_ids = list(contact_assoc.keys())
     now = datetime.utcnow()
 
-    # Soft-delete all existing rows for these deals
     for chunk in _chunk_list(deal_ids, 500):
         db.execute(
             update(DealContact)
@@ -814,7 +828,6 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
             .values(deleted_at=now, updated_at=now, change_source="initial_load_replace")
         )
 
-    # Re-insert active associations
     for deal_id, contact_ids in contact_assoc.items():
         for contact_id in contact_ids:
             existing = db.execute(
@@ -840,7 +853,6 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
 
 
 def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) -> None:
-    """Replace all deal-company associations from initial load."""
     deal_ids = list(company_assoc.keys())
     now = datetime.utcnow()
 
