@@ -56,18 +56,6 @@ async def start_load(
     )
 
 
-@router.get("/load/status/{job_id}", summary="Check job status")
-async def get_status(job_id: str):
-    """Returns current progress from memory cache or DB fallback."""
-    return await service.get_status(job_id)
-
-
-@router.get("/load/result/{job_id}", summary="Get completed job result")
-async def get_result(job_id: str):
-    """Returns the final result of a completed sync job."""
-    return await service.get_result(job_id)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBHOOK ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════

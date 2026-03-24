@@ -210,28 +210,6 @@ async def start_load(
     )
 
 
-async def get_status(job_id: str) -> LoadProgress:
-    if job_id in _jobs:
-        return _jobs[job_id]
-    db = SessionLocal()
-    try:
-        prog = get_job_progress(db, job_id)
-        if not prog:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return prog
-    finally:
-        db.close()
-
-
-async def get_result(job_id: str) -> LoadProgress:
-    progress = await get_status(job_id)
-    if progress.status == LoadStatus.RUNNING:
-        raise HTTPException(status_code=202, detail="Job still running — poll /load/status")
-    if progress.status == LoadStatus.FAILED:
-        raise HTTPException(status_code=500, detail=progress.error)
-    return progress
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBHOOK HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -937,27 +915,6 @@ def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -
 
     db.commit()
     return job
-
-
-def get_job_progress(db: Session, job_id: str) -> Optional[LoadProgress]:
-    job = db.execute(select(Job).where(Job.job_id == job_id)).scalar_one_or_none()
-    if not job:
-        return None
-    return LoadProgress(
-        job_id=job.job_id,
-        status=LoadStatus(job.status),
-        pages_processed=job.pages_processed or 0,
-        deals_fetched=job.deals_fetched or 0,
-        contacts_fetched=job.contacts_fetched or 0,
-        companies_fetched=job.companies_fetched or 0,
-        attachments_fetched=job.attachments_fetched or 0,
-        api_calls_made=job.api_calls_made or 0,
-        errors=json.loads(job.errors_json) if job.errors_json else [],
-        error=job.error,
-        started_at=job.started_at.isoformat() if job.started_at else "",
-        completed_at=job.completed_at.isoformat() if job.completed_at else None,
-        result_sample=json.loads(job.result_sample_json) if job.result_sample_json else [],
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
