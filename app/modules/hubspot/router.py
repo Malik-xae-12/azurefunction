@@ -1,4 +1,4 @@
-"""HubSpot API router."""
+"""HubSpot API router. """
 
 import logging
 import os
