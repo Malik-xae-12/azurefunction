@@ -28,7 +28,7 @@ MarkupSafe==3.0.3
 mdurl==0.1.2
 multidict==6.7.1
 propcache==0.4.1
-psycopg2==2.9.11
+psycopg2-binary
 pydantic==2.12.5
 pydantic-extra-types==2.11.0
 pydantic-settings==2.13.1

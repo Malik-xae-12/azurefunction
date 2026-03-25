@@ -445,22 +445,38 @@ def _handle_association_change(
             )
             logger.info("ASSOC REMOVED: deal %s ↔ contact %s", deal_id, contact_id)
         else:
-            # FIX 2: always insert a fresh row; never reactivate a deleted one
-            db.add(DealContact(
-                deal_id=deal_id,
-                contact_id=contact_id,
-                association_type=a_type,
-                is_primary=is_primary,
-                portal_id=portal_id,        # FIX 3
-                change_source=source,
-                created_at=now,
-                updated_at=now,
-                deleted_at=None,
-            ))
-            logger.info(
-                "ASSOC ADDED (new row): deal %s ↔ contact %s (primary=%s)",
-                deal_id, contact_id, is_primary,
-            )
+            # Upsert: update existing active row if present, otherwise insert
+            existing = db.query(DealContact).filter(
+                DealContact.deal_id == deal_id,
+                DealContact.contact_id == contact_id,
+                DealContact.deleted_at.is_(None),
+            ).first()
+            if existing:
+                existing.association_type = a_type
+                existing.is_primary = is_primary
+                existing.portal_id = portal_id
+                existing.change_source = source
+                existing.updated_at = now
+                logger.info(
+                    "ASSOC UPDATED: deal %s ↔ contact %s (primary=%s)",
+                    deal_id, contact_id, is_primary,
+                )
+            else:
+                db.add(DealContact(
+                    deal_id=deal_id,
+                    contact_id=contact_id,
+                    association_type=a_type,
+                    is_primary=is_primary,
+                    portal_id=portal_id,
+                    change_source=source,
+                    created_at=now,
+                    updated_at=now,
+                    deleted_at=None,
+                ))
+                logger.info(
+                    "ASSOC ADDED (new row): deal %s ↔ contact %s (primary=%s)",
+                    deal_id, contact_id, is_primary,
+                )
 
     # ── DEAL ↔ COMPANY ────────────────────────────────────────────────────────
     elif a_type == "DEAL_TO_COMPANY":
@@ -482,22 +498,38 @@ def _handle_association_change(
             )
             logger.info("ASSOC REMOVED: deal %s ↔ company %s", deal_id, company_id)
         else:
-            # FIX 2: always insert a fresh row
-            db.add(DealCompany(
-                deal_id=deal_id,
-                company_id=company_id,
-                association_type=a_type,
-                is_primary=is_primary,
-                portal_id=portal_id,        # FIX 3
-                change_source=source,
-                created_at=now,
-                updated_at=now,
-                deleted_at=None,
-            ))
-            logger.info(
-                "ASSOC ADDED (new row): deal %s ↔ company %s (primary=%s)",
-                deal_id, company_id, is_primary,
-            )
+            # Upsert: update existing active row if present, otherwise insert
+            existing = db.query(DealCompany).filter(
+                DealCompany.deal_id == deal_id,
+                DealCompany.company_id == company_id,
+                DealCompany.deleted_at.is_(None),
+            ).first()
+            if existing:
+                existing.association_type = a_type
+                existing.is_primary = is_primary
+                existing.portal_id = portal_id
+                existing.change_source = source
+                existing.updated_at = now
+                logger.info(
+                    "ASSOC UPDATED: deal %s ↔ company %s (primary=%s)",
+                    deal_id, company_id, is_primary,
+                )
+            else:
+                db.add(DealCompany(
+                    deal_id=deal_id,
+                    company_id=company_id,
+                    association_type=a_type,
+                    is_primary=is_primary,
+                    portal_id=portal_id,
+                    change_source=source,
+                    created_at=now,
+                    updated_at=now,
+                    deleted_at=None,
+                ))
+                logger.info(
+                    "ASSOC ADDED (new row): deal %s ↔ company %s (primary=%s)",
+                    deal_id, company_id, is_primary,
+                )
 
     else:
         logger.debug("Unhandled association type: %s — ignoring", a_type)
