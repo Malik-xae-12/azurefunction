@@ -821,55 +821,92 @@ def persist_load_data(
 
 def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> None:
     """
-    Initial load: soft-delete all existing active rows for the batch, then
-    insert fresh rows.  Previously soft-deleted rows are left intact (audit trail).
+    Initial load: sync associations without creating duplicate rows.
+    - Active row still in HubSpot  → touch updated_at only (no new row)
+    - New association               → insert fresh row
+    - Active row gone from HubSpot → soft-delete
+    - Previously soft-deleted row  → leave untouched (audit trail preserved)
     """
-    deal_ids = list(contact_assoc.keys())
     now = datetime.utcnow()
 
-    for chunk in _chunk_list(deal_ids, 500):
-        db.execute(
-            update(DealContact)
-            .where(DealContact.deal_id.in_(chunk), DealContact.deleted_at.is_(None))
-            .values(deleted_at=now, updated_at=now, change_source="initial_load_replace")
-        )
-
     for deal_id, contact_ids in contact_assoc.items():
-        for contact_id in contact_ids:
-            db.add(DealContact(
-                deal_id=str(deal_id),
-                contact_id=str(contact_id),
-                association_type="DEAL_TO_CONTACT",
-                change_source="initial_load",
-                created_at=now,
-                updated_at=now,
-                deleted_at=None,
-            ))
+        incoming = {str(c) for c in contact_ids}
+
+        # Fetch all currently active rows for this deal
+        active_rows: List[DealContact] = db.query(DealContact).filter(
+            DealContact.deal_id == str(deal_id),
+            DealContact.deleted_at.is_(None),
+        ).all()
+
+        active_map = {row.contact_id: row for row in active_rows}
+        active_ids = set(active_map.keys())
+
+        # Soft-delete rows no longer in HubSpot
+        for contact_id in active_ids - incoming:
+            row = active_map[contact_id]
+            row.deleted_at = now
+            row.updated_at = now
+            row.change_source = "initial_load_replace"
+
+        # Update existing or insert new
+        for contact_id in incoming:
+            if contact_id in active_map:
+                # Already active — just refresh the timestamp, no new row
+                active_map[contact_id].updated_at = now
+                active_map[contact_id].change_source = "initial_load"
+            else:
+                # Not active (either brand new or was previously deleted)
+                # Always insert a fresh row — old deleted rows stay untouched
+                db.add(DealContact(
+                    deal_id=str(deal_id),
+                    contact_id=contact_id,
+                    association_type="DEAL_TO_CONTACT",
+                    change_source="initial_load",
+                    created_at=now,
+                    updated_at=now,
+                    deleted_at=None,
+                ))
 
 
 def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) -> None:
-    deal_ids = list(company_assoc.keys())
+    """
+    Same sync logic as _replace_deal_contacts but for DealCompany rows.
+    """
     now = datetime.utcnow()
 
-    for chunk in _chunk_list(deal_ids, 500):
-        db.execute(
-            update(DealCompany)
-            .where(DealCompany.deal_id.in_(chunk), DealCompany.deleted_at.is_(None))
-            .values(deleted_at=now, updated_at=now, change_source="initial_load_replace")
-        )
-
     for deal_id, company_ids in company_assoc.items():
-        for company_id in company_ids:
-            db.add(DealCompany(
-                deal_id=str(deal_id),
-                company_id=str(company_id),
-                association_type="DEAL_TO_COMPANY",
-                change_source="initial_load",
-                created_at=now,
-                updated_at=now,
-                deleted_at=None,
-            ))
+        incoming = {str(c) for c in company_ids}
 
+        active_rows: List[DealCompany] = db.query(DealCompany).filter(
+            DealCompany.deal_id == str(deal_id),
+            DealCompany.deleted_at.is_(None),
+        ).all()
+
+        active_map = {row.company_id: row for row in active_rows}
+        active_ids = set(active_map.keys())
+
+        # Soft-delete rows no longer in HubSpot
+        for company_id in active_ids - incoming:
+            row = active_map[company_id]
+            row.deleted_at = now
+            row.updated_at = now
+            row.change_source = "initial_load_replace"
+
+        # Update existing or insert new
+        for company_id in incoming:
+            if company_id in active_map:
+                active_map[company_id].updated_at = now
+                active_map[company_id].change_source = "initial_load"
+            else:
+                db.add(DealCompany(
+                    deal_id=str(deal_id),
+                    company_id=company_id,
+                    association_type="DEAL_TO_COMPANY",
+                    change_source="initial_load",
+                    created_at=now,
+                    updated_at=now,
+                    deleted_at=None,
+                ))
 
 def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
     deal_ids = list(attachments_map.keys())
