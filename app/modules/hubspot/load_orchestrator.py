@@ -78,13 +78,15 @@ class LoadOrchestrator:
             yield self._progress
 
             # ── Phase 4: Attachments per deal ─────────────────────────────────
-            attachment_tasks = [
-                self._fetch_deal_attachments(
-                    d["id"],
-                    d.get("properties", {}).get("proposalattachments", ""),
+            attachment_tasks = []
+            for d in all_deals:
+                props = d.get("properties", {})
+                raw_val = props.get("proposalattachments")
+                if raw_val:
+                    logger.info("deal %s: proposalattachments = %s", d["id"], raw_val)
+                attachment_tasks.append(
+                    self._fetch_deal_attachments(d["id"], raw_val or "")
                 )
-                for d in all_deals
-            ]
             attachment_results = await asyncio.gather(*attachment_tasks, return_exceptions=True)
 
             total_attachments = 0
@@ -196,7 +198,8 @@ class LoadOrchestrator:
         if not proposalattachments_raw:
             return []
 
-        file_ids = [fid.strip() for fid in proposalattachments_raw.split(";") if fid.strip()]
+        file_ids = [fid.strip() for fid in str(proposalattachments_raw).split(";") if fid.strip()]
+        logger.info("deal %s: parsing %d file IDs from proposalattachments: %s", deal_id, len(file_ids), file_ids)
         results = []
         for fid in file_ids:
             entry: Dict[str, Any] = {"deal_id": deal_id, "file_id": fid}
