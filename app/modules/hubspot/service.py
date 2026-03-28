@@ -138,7 +138,6 @@ def _write_audit(
     record_id: str,
     action: str,                          # human-readable e.g. "deal updated"
     changed_fields: Optional[Dict] = None,
-    associated_record_id: Optional[str] = None,
     performed_by: Optional[str] = None,
     source: Optional[str] = None,
     hs_event_id: Optional[str] = None,
@@ -149,7 +148,6 @@ def _write_audit(
         record_id=str(record_id),
         action=action,
         changed_fields=json.dumps(changed_fields) if changed_fields else None,
-        associated_record_id=associated_record_id,
         performed_by=performed_by,
         source=source,
         hs_event_id=str(hs_event_id) if hs_event_id is not None else None,
@@ -469,7 +467,6 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
     for dc in active_contacts:
         _write_audit(db, table_name="deal_contacts", record_id=str(dc.id),
                      action="contact removed",
-                     associated_record_id=dc.contact_id,
                      source="deal_deleted", **evt_kwargs)
     if active_contacts:
         db.execute(
@@ -488,7 +485,6 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
     for dc in active_companies:
         _write_audit(db, table_name="deal_companies", record_id=str(dc.id),
                      action="company removed",
-                     associated_record_id=dc.company_id,
                      source="deal_deleted", **evt_kwargs)
     if active_companies:
         db.execute(
@@ -599,7 +595,6 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_contacts", record_id=str(row.id),
                     action="contact removed",
-                    associated_record_id=contact_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
             db.execute(
@@ -629,7 +624,6 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_contacts", record_id=str(new_row.id),
                     action="contact linked",
-                    associated_record_id=contact_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
 
@@ -650,7 +644,6 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_companies", record_id=str(row.id),
                     action="company removed",
-                    associated_record_id=company_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
             db.execute(
@@ -680,7 +673,6 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_companies", record_id=str(new_row.id),
                     action="company linked",
-                    associated_record_id=company_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
 
@@ -838,7 +830,6 @@ def _upsert_contacts(
                         db, table_name="deal_contacts", record_id=str(dc.id),
                         action="contact updated",
                         changed_fields=diff,
-                        associated_record_id=cid,
                         source=change_source, **evt_kwargs,
                     )
 
@@ -921,7 +912,6 @@ def _upsert_companies(
                         db, table_name="deal_companies", record_id=str(dc.id),
                         action="company updated",
                         changed_fields=diff,
-                        associated_record_id=cid,
                         source=change_source, **evt_kwargs,
                     )
 
@@ -965,7 +955,6 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
             row.updated_at = now
             _write_audit(db, table_name="deal_contacts", record_id=str(row.id),
                          action="contact removed",
-                         associated_record_id=contact_id,
                          source="initial_load_replace")
 
         for contact_id in incoming:
@@ -981,7 +970,6 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
                 db.flush()
                 _write_audit(db, table_name="deal_contacts", record_id=str(new_row.id),
                              action="contact linked",
-                             associated_record_id=contact_id,
                              source="initial_load")
 
 
@@ -1001,7 +989,6 @@ def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) ->
             row.updated_at = now
             _write_audit(db, table_name="deal_companies", record_id=str(row.id),
                          action="company removed",
-                         associated_record_id=company_id,
                          source="initial_load_replace")
 
         for company_id in incoming:
@@ -1017,7 +1004,6 @@ def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) ->
                 db.flush()
                 _write_audit(db, table_name="deal_companies", record_id=str(new_row.id),
                              action="company linked",
-                             associated_record_id=company_id,
                              source="initial_load")
 
 

@@ -58,12 +58,6 @@ class AuditLog(Base):
         comment='JSON: {"dealname": {"old": "Foo", "new": "Bar"}} — NULL on creation / initial_load',
     )
 
-    # ── Associated record (contact/company involved in this event) ────────────
-    associated_record_id = Column(
-        String(64), nullable=True,
-        comment="ID of the associated contact or company affected by this event",
-    )
-
     # ── Who performed the action ──────────────────────────────────────────────
     performed_by = Column(
         String(64), nullable=True,
@@ -101,7 +95,6 @@ class AuditLog(Base):
         Index("ix_audit_created_at", "created_at"),
         Index("ix_audit_performed_by", "performed_by"),
         Index("ix_audit_source", "source"),
-        Index("ix_audit_associated_record", "associated_record_id"),
     )
 
     def __repr__(self) -> str:
