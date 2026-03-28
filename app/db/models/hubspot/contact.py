@@ -1,51 +1,34 @@
-"""Contact ORM model — production-ready."""
+"""Contact ORM model — columns match HubSpot Create Contact form exactly. No soft-delete columns."""
 
-from datetime import datetime
+from sqlalchemy import Column, Index, String
 
-from sqlalchemy import Column, DateTime, Index, String
-from sqlalchemy.sql import func
-from sqlalchemy.ext.hybrid import hybrid_property
 from app.db.base import Base
+
 
 class Contact(Base):
     __tablename__ = "contacts"
- 
-    id = Column(String(64), primary_key=True, comment="HubSpot contact ID")
+
+    # ── Primary key ───────────────────────────────────────────────────────────
+    id = Column(String(64), primary_key=True, comment="HubSpot contact ID (hs_object_id)")
     hs_object_id = Column(String(64), nullable=True, index=True)
- 
+
+    # ── Fields matching HubSpot Create Contact form (top to bottom) ───────────
     email = Column(String(320), nullable=True, index=True)
     firstname = Column(String(256), nullable=True)
     lastname = Column(String(256), nullable=True)
-    phone = Column(String(64), nullable=True)
-    mobilephone = Column(String(64), nullable=True)
-    city = Column(String(128), nullable=True)
-    country = Column(String(128), nullable=True)
-    company = Column(String(512), nullable=True, comment="Company name field on the contact")
-    closedate = Column(String(32), nullable=True)
+    hubspot_owner_id = Column(String(64), nullable=True, comment="Contact owner — HubSpot user ID")
+    jobtitle = Column(String(256), nullable=True, comment="Job title")
+    phone = Column(String(64), nullable=True, comment="Phone number")
+    lifecyclestage = Column(String(64), nullable=True, comment="e.g. lead, customer, opportunity")
+    lead_status = Column(String(64), nullable=True, comment="hs_lead_status from HubSpot")
+
+    # ── HubSpot system timestamps (stored as raw strings from API) ────────────
     createdate = Column(String(32), nullable=True)
     lastmodifieddate = Column(String(32), nullable=True)
- 
-    synced_at = Column(
-        DateTime,
-        nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        server_default=func.now(),
-    )
-    deleted_at = Column(DateTime, nullable=True)
- 
+
     __table_args__ = (
-        Index("ix_contacts_deleted_at", "deleted_at"),
+        Index("ix_contacts_owner", "hubspot_owner_id"),
     )
- 
-    # ── FIX 4 ─────────────────────────────────────────────────────────────────
-    @hybrid_property
-    def is_active(self) -> bool:
-        return self.deleted_at is None
- 
-    @is_active.expression
-    def is_active(cls):  # noqa: N805
-        return cls.deleted_at.is_(None)
- 
+
     def __repr__(self) -> str:
         return f"<Contact id={self.id} email={self.email!r}>"

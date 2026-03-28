@@ -1,14 +1,19 @@
-"""HubSpot API router. """
+"""HubSpot API router."""
 
 import logging
-import os
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from app.core.config import settings
 from app.core.security import verify_hubspot_signature
 from app.modules.hubspot import service
 from app.modules.hubspot.schema import HubSpotWebhookEvent
+from app.modules.hubspot.service import (
+    DEAL_PROPERTIES,
+    CONTACT_PROPERTIES,
+    COMPANY_PROPERTIES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,19 +27,15 @@ router = APIRouter(prefix="/hubspot", tags=["HubSpot"])
 @router.post("/load/start", summary="Start full HubSpot sync (streams live SSE progress)")
 async def start_load(
     deal_properties: str = Query(
-        default=(
-            "dealname,amount,dealstage,closedate,pipeline,hubspot_owner_id,"
-            "deal_owner_email,delivery_owner,project_start_date,project_end_date,"
-            "po_hours,dealtype,description"
-        ),
+        default=",".join(DEAL_PROPERTIES),
         description="Comma-separated deal properties to fetch",
     ),
     contact_properties: str = Query(
-        default="firstname,lastname,email,phone,mobilephone,city,country,company,closedate",
+        default=",".join(CONTACT_PROPERTIES),
         description="Comma-separated contact properties to fetch",
     ),
     company_properties: str = Query(
-        default="name,domain,industry,city,country",
+        default=",".join(COMPANY_PROPERTIES),
         description="Comma-separated company properties to fetch",
     ),
 ):
@@ -42,7 +43,7 @@ async def start_load(
     Runs a full HubSpot sync and streams live progress as Server-Sent Events.
     HubSpot access token is read from HUBSPOT_ACCESS_TOKEN env var.
     """
-    hubspot_token = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
+    hubspot_token = settings.HUBSPOT_ACCESS_TOKEN.strip()
     if not hubspot_token:
         raise HTTPException(
             status_code=500,
@@ -85,7 +86,7 @@ async def hubspot_webhook(
     Signature is validated before this handler runs (via Depends).
     HubSpot access token is read from HUBSPOT_ACCESS_TOKEN env var.
     """
-    hubspot_token = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
+    hubspot_token = settings.HUBSPOT_ACCESS_TOKEN.strip()
     if not hubspot_token:
         raise HTTPException(
             status_code=500,

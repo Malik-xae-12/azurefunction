@@ -1,26 +1,23 @@
-from datetime import datetime
- 
-from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text
+"""Deal ORM model — production-ready with full audit trail. All timestamps in IST."""
+
+from sqlalchemy import Boolean, Column, DateTime, Index, String, Text
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.sql import func
- 
+
 from app.db.base import Base
- 
- 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DEAL
-# ═══════════════════════════════════════════════════════════════════════════════
- 
+from app.utils.timezone import now_ist
+
+
 class Deal(Base):
     __tablename__ = "deals"
- 
+
     # ── Primary key ───────────────────────────────────────────────────────────
     id = Column(String(64), primary_key=True, comment="HubSpot deal ID (hs_object_id)")
- 
+
     # ── HubSpot identity ──────────────────────────────────────────────────────
     hs_object_id = Column(String(64), nullable=True, index=True)
     portal_id = Column(String(32), nullable=True, comment="HubSpot portal / account ID")
- 
+
     # ── Core deal fields ──────────────────────────────────────────────────────
     dealname = Column(String(512), nullable=True)
     amount = Column(String(64), nullable=True, comment="Raw string from HubSpot; cast at query time")
@@ -32,44 +29,87 @@ class Deal(Base):
     closedate = Column(String(32), nullable=True)
     createdate = Column(String(32), nullable=True)
     hs_lastmodifieddate = Column(String(32), nullable=True)
- 
+
     # ── Ownership ─────────────────────────────────────────────────────────────
     hubspot_owner_id = Column(String(64), nullable=True)
     deal_owner_email = Column(String(256), nullable=True)
     delivery_owner = Column(String(256), nullable=True)
- 
+
     # ── Project scheduling ────────────────────────────────────────────────────
     project_start_date = Column(String(32), nullable=True)
     project_end_date = Column(String(32), nullable=True)
     po_hours = Column(String(32), nullable=True)
- 
-    # ── Audit / soft-delete ───────────────────────────────────────────────────
-    synced_at = Column(
-        DateTime,
+
+    # ── Audit columns (all IST) ───────────────────────────────────────────────
+    created_at = Column(
+        DateTime(timezone=True),
         nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=now_ist,
         server_default=func.now(),
-        comment="Last time this row was written by our sync",
+        comment="When this row was first inserted (IST)",
     )
-    deleted_at = Column(DateTime, nullable=True, comment="Soft-delete timestamp; NULL = active")
- 
+    created_by = Column(
+        String(64),
+        nullable=True,
+        comment="hubspot_owner_id at creation, or system source (e.g. 'initial_load')",
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=now_ist,
+        onupdate=now_ist,
+        server_default=func.now(),
+        comment="Last time this row was modified (IST)",
+    )
+    updated_by = Column(
+        String(64),
+        nullable=True,
+        comment="hubspot_owner_id or system source that last updated this row",
+    )
+    deleted_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Soft-delete timestamp (IST); NULL = deal is active",
+    )
+    deleted_by = Column(
+        String(64),
+        nullable=True,
+        comment="hubspot_owner_id or system source that triggered the deletion",
+    )
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default="1",
+        comment="1 = active, 0 = soft-deleted. Always kept in sync with deleted_at.",
+    )
+
     __table_args__ = (
         Index("ix_deals_pipeline_stage", "pipeline", "dealstage"),
         Index("ix_deals_deleted_at", "deleted_at"),
         Index("ix_deals_owner", "hubspot_owner_id"),
+        Index("ix_deals_is_active", "is_active"),
     )
- 
-    # ── FIX 4: is_active hybrid property ─────────────────────────────────────
+
     @hybrid_property
-    def is_active(self) -> bool:
-        """Python-side: True when the deal has not been soft-deleted."""
-        return self.deleted_at is None
- 
-    @is_active.expression
-    def is_active(cls):  # noqa: N805
-        """SQL-side: usable in .where(Deal.is_active) filter expressions."""
-        return cls.deleted_at.is_(None)
- 
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
+
+    @is_deleted.expression
+    def is_deleted(cls):  # noqa: N805
+        return cls.deleted_at.isnot(None)
+
+    def soft_delete(self, by: str = None) -> None:
+        """Soft-delete this deal. Flush/commit after calling."""
+        now = now_ist()
+        self.deleted_at = now
+        self.deleted_by = by
+        self.is_active = False
+        self.updated_at = now
+        self.updated_by = by
+
     def __repr__(self) -> str:
-        return f"<Deal id={self.id} name={self.dealname!r} stage={self.dealstage_label!r}>"
+        return (
+            f"<Deal id={self.id} name={self.dealname!r} "
+            f"stage={self.dealstage_label!r} active={self.is_active}>"
+        )

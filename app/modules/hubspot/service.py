@@ -1,6 +1,27 @@
+"""
+HubSpot service layer.
+
+Webhook events handled:
+  deal.creation / deal.propertyChange / deal.deletion / deal.associationChange
+  contact.propertyChange   → if contact exists in DB: update it + write "contact updated" audit
+  company.propertyChange   → if company exists in DB: update it + write "company updated" audit
+
+Audit actions written (human-readable):
+  deal created, deal updated, deal deleted
+  contact created, contact updated, contact linked, contact removed
+  company created, company updated, company linked, company removed
+
+Contact/Company have NO soft-delete. Records are simply upserted or deleted in place.
+Association tables (deal_contacts, deal_companies) carry the link lifecycle via deleted_at.
+
+performed_by resolution from webhook sourceId:
+  "userId:89164629"           → performed_by = "89164629"
+  "PRIMARY_AUTOMATION" / None → performed_by = None  (system)
+  "objectTypeId:0-1;..."      → performed_by = None  (cascade)
+"""
+
 import json
 import logging
-from datetime import datetime
 from typing import AsyncGenerator, Dict, Iterable, List, Optional
 
 from fastapi.responses import StreamingResponse
@@ -9,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.hubspot import (
     Attachment,
+    AuditLog,
     Company,
     Contact,
     Deal,
@@ -20,13 +42,13 @@ from app.db.session import SessionLocal
 from app.modules.hubspot.hubspot_client import HubSpotClient
 from app.modules.hubspot.load_orchestrator import LoadOrchestrator
 from app.modules.hubspot.schema import HubSpotWebhookEvent, LoadProgress, LoadStatus
+from app.utils.timezone import now_ist
 
 logger = logging.getLogger(__name__)
 
-# In-memory job cache (lost on restart — DB is the source of truth)
 _jobs: Dict[str, LoadProgress] = {}
 
-# Properties that fire constantly but carry no meaningful DB change
+# ── Properties to skip entirely (noise / computed by HubSpot) ────────────────
 IGNORED_PROPERTIES = {
     "hs_lastmodifieddate",
     "hs_last_activity_date",
@@ -39,33 +61,122 @@ IGNORED_PROPERTIES = {
     "engagements_last_meeting_booked",
 }
 
+# ── HubSpot API property lists ────────────────────────────────────────────────
 DEAL_PROPERTIES = [
     "dealname", "amount", "dealstage", "closedate", "pipeline",
     "hubspot_owner_id", "deal_owner_email", "delivery_owner",
     "project_start_date", "project_end_date", "po_hours",
     "dealtype", "description", "createdate", "hs_lastmodifieddate", "hs_object_id",
 ]
-
 CONTACT_PROPERTIES = [
-    "email", "firstname", "lastname", "phone", "mobilephone",
-    "city", "country", "company", "closedate", "createdate",
-    "lastmodifieddate", "hs_object_id",
+    "email", "firstname", "lastname", "hubspot_owner_id",
+    "jobtitle", "phone", "lifecyclestage", "hs_lead_status",
+    "createdate", "lastmodifieddate", "hs_object_id",
 ]
-
 COMPANY_PROPERTIES = [
-    "name", "domain", "industry", "city", "country",
+    "domain", "name", "hubspot_owner_id", "industry", "type",
+    "city", "state", "zip", "numberofemployees", "annualrevenue",
+    "timezone", "description", "linkedin_company_page",
     "createdate", "hs_lastmodifieddate", "hs_object_id",
 ]
+
+# ── Fields tracked in audit diffs ────────────────────────────────────────────
+_DEAL_AUDIT_FIELDS = {
+    "dealname", "amount", "dealstage", "dealstage_label", "closedate",
+    "pipeline", "dealtype", "description", "hubspot_owner_id",
+    "deal_owner_email", "delivery_owner", "project_start_date",
+    "project_end_date", "po_hours",
+}
+_CONTACT_AUDIT_FIELDS = {
+    "email", "firstname", "lastname", "hubspot_owner_id",
+    "jobtitle", "phone", "lifecyclestage", "lead_status",
+}
+_COMPANY_AUDIT_FIELDS = {
+    "domain", "name", "hubspot_owner_id", "industry", "company_type",
+    "city", "state", "postal_code", "number_of_employees",
+    "annual_revenue", "timezone", "description", "linkedin_company_page",
+}
 
 
 def _is_ignored_property(name: Optional[str]) -> bool:
     if not name:
         return False
-    if name in IGNORED_PROPERTIES:
-        return True
-    if name.startswith("hs_time_in_"):
-        return True
-    return False
+    return name in IGNORED_PROPERTIES or name.startswith("hs_time_in_")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHO DID IT — resolve from webhook sourceId
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_actor(event: HubSpotWebhookEvent) -> tuple[Optional[str], Optional[str]]:
+    """
+    Returns (performed_by, performed_by_raw).
+
+    performed_by     : HubSpot userId string e.g. "89164629", or None for system events
+    performed_by_raw : full raw sourceId string for traceability
+
+    sourceId formats:
+      "userId:89164629"                                → human user
+      "objectTypeId:0-1;originalObjectId:460880..."    → system cascade
+      None / absent                                    → automation or initial_load
+    """
+    source_id: Optional[str] = getattr(event, "sourceId", None)
+    if not source_id:
+        return None, None
+    if source_id.startswith("userId:"):
+        return source_id.split("userId:", 1)[1].strip(), source_id
+    return None, source_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUDIT HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _write_audit(
+    db: Session,
+    *,
+    table_name: str,
+    record_id: str,
+    action: str,                          # human-readable e.g. "deal updated"
+    changed_fields: Optional[Dict] = None,
+    deal_id: Optional[str] = None,
+    related_table: Optional[str] = None,
+    related_id: Optional[str] = None,
+    performed_by: Optional[str] = None,
+    performed_by_raw: Optional[str] = None,
+    source: Optional[str] = None,
+    hs_event_id: Optional[str] = None,
+    hs_occurred_at: Optional[str] = None,
+) -> None:
+    db.add(AuditLog(
+        table_name=table_name,
+        record_id=str(record_id),
+        action=action,
+        changed_fields=json.dumps(changed_fields) if changed_fields else None,
+        deal_id=deal_id,
+        related_table=related_table,
+        related_id=related_id,
+        performed_by=performed_by,
+        performed_by_raw=performed_by_raw,
+        source=source,
+        hs_event_id=str(hs_event_id) if hs_event_id is not None else None,
+        hs_occurred_at=str(hs_occurred_at) if hs_occurred_at is not None else None,
+        created_at=now_ist(),
+    ))
+
+
+def _diff_fields(old_obj, new_values: Dict, tracked: set) -> Dict:
+    def _n(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    return {
+        f: {"old": _n(getattr(old_obj, f, None)), "new": _n(new_values.get(f))}
+        for f in tracked
+        if _n(getattr(old_obj, f, None)) != _n(new_values.get(f))
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -78,11 +189,11 @@ async def start_load(
     contact_properties: str,
     company_properties: str,
 ) -> StreamingResponse:
-    job_id = f"load_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
+    job_id = f"load_{now_ist().strftime('%Y%m%d_%H%M%S_%f')}"
 
     db = SessionLocal()
     try:
-        create_job(db, job_id=job_id, started_at=datetime.utcnow())
+        create_job(db, job_id=job_id, started_at=now_ist())
     finally:
         db.close()
 
@@ -94,19 +205,19 @@ async def start_load(
 
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
-            async for update_event in orchestrator.run(
+            async for upd in orchestrator.run(
                 deal_properties=deal_properties.split(","),
                 contact_properties=contact_properties.split(","),
                 company_properties=company_properties.split(","),
             ):
-                progress.deals_fetched = update_event.deals_fetched
-                progress.contacts_fetched = update_event.contacts_fetched
-                progress.companies_fetched = update_event.companies_fetched
-                progress.attachments_fetched = update_event.attachments_fetched
-                progress.pages_processed = update_event.pages_processed
-                progress.api_calls_made = update_event.api_calls_made
-                progress.errors = update_event.errors
-                progress.result_sample = update_event.result_sample
+                progress.deals_fetched = upd.deals_fetched
+                progress.contacts_fetched = upd.contacts_fetched
+                progress.companies_fetched = upd.companies_fetched
+                progress.attachments_fetched = upd.attachments_fetched
+                progress.pages_processed = upd.pages_processed
+                progress.api_calls_made = upd.api_calls_made
+                progress.errors = upd.errors
+                progress.result_sample = upd.result_sample
 
                 db = SessionLocal()
                 try:
@@ -115,13 +226,9 @@ async def start_load(
                     db.close()
 
                 yield f"data: {progress.model_dump_json()}\n\n"
-                logger.info(
-                    "[%s] Progress: %d deals, %d API calls",
-                    job_id, progress.deals_fetched, progress.api_calls_made,
-                )
 
             progress.status = LoadStatus.COMPLETED
-            progress.completed_at = datetime.utcnow().isoformat()
+            progress.completed_at = now_ist().isoformat()
 
             db = SessionLocal()
             try:
@@ -133,13 +240,12 @@ async def start_load(
                 db.close()
 
             yield f"data: {progress.model_dump_json()}\n\n"
-            logger.info("[%s] COMPLETED — %d deals", job_id, progress.deals_fetched)
 
         except Exception as exc:
             logger.exception("[%s] FAILED", job_id)
             progress.status = LoadStatus.FAILED
             progress.error = str(exc)
-            progress.completed_at = datetime.utcnow().isoformat()
+            progress.completed_at = now_ist().isoformat()
 
             db = SessionLocal()
             try:
@@ -163,62 +269,60 @@ async def start_load(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEBHOOK HANDLER
+# WEBHOOK DISPATCHER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) -> Dict:
     """
     Dispatch HubSpot webhook events.
 
-    Handled:
-      deal.creation / deal.propertyChange / deal.deletion / deal.associationChange
-      contact.propertyChange   (only if contact already exists in DB)
-      company.propertyChange   (only if company already exists in DB)
+    contact.propertyChange / company.propertyChange:
+      → check if record exists in DB
+      → if yes: fetch full record from HubSpot API, update DB, write audit
+      → if no:  skip (we only track contacts/companies that are linked to deals)
 
-    Intentionally ignored:
-      contact.creation, contact.deletion, contact.associationChange
-      company.creation, company.deletion, company.associationChange
+    deal.associationChange:
+      → adds "contact linked" / "company linked" or "contact removed" / "company removed" to audit
     """
     processed = 0
     errors: List[str] = []
 
-    # ── Dedup upsert-type events per (object_type, objectId) ─────────────────
-    # For creation/propertyChange events on the same object in one batch,
-    # keep only the last (most recent) — one full fetch covers all changes.
-    # Association events are never deduped — each is a distinct edge operation.
-    seen_upsert_keys: set = set()
+    # Dedup: for creation/propertyChange keep only the last event per (type, objectId)
+    seen: set = set()
     deduped: List[HubSpotWebhookEvent] = []
-
     for event in reversed(events):
         sub = event.subscriptionType or ""
-        is_upsert = sub.endswith(".creation") or sub.endswith(".propertyChange")
-        if is_upsert and event.objectId is not None:
+        if (sub.endswith(".creation") or sub.endswith(".propertyChange")) and event.objectId is not None:
             key = (sub.split(".")[0], event.objectId)
-            if key in seen_upsert_keys:
+            if key in seen:
                 processed += 1
                 continue
-            seen_upsert_keys.add(key)
+            seen.add(key)
         deduped.append(event)
-
     deduped.reverse()
 
     for event in deduped:
         try:
             object_id = str(event.objectId) if event.objectId is not None else ""
             sub_type = event.subscriptionType
+            performed_by, performed_by_raw = _parse_actor(event)
 
-            # ── Skip noisy property events ────────────────────────────────────
+            evt_kwargs = dict(
+                performed_by=performed_by,
+                performed_by_raw=performed_by_raw,
+                hs_event_id=getattr(event, "eventId", None),
+                hs_occurred_at=getattr(event, "occurredAt", None),
+            )
+
             if sub_type.endswith(".propertyChange") and _is_ignored_property(event.propertyName):
-                logger.debug("Skipping ignored property event: %s", event.propertyName)
                 processed += 1
                 continue
 
-            # ── DEAL ─────────────────────────────────────────────────────────
-
+            # ── DEAL ──────────────────────────────────────────────────────────
             if sub_type == "deal.deletion":
                 db = SessionLocal()
                 try:
-                    _soft_delete_deal(db, object_id)
+                    _soft_delete_deal(db, object_id, evt_kwargs)
                 finally:
                     db.close()
 
@@ -230,45 +334,35 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
                         stage_map = await _get_stage_map(client)
                         db = SessionLocal()
                         try:
-                            _upsert_deals(db, [deal_data], stage_map, change_source="webhook")
+                            _upsert_deals(db, [deal_data], stage_map,
+                                          change_source="webhook", evt_kwargs=evt_kwargs)
                             db.commit()
-                            logger.info(
-                                "Upserted deal %s via webhook (%s)", object_id, sub_type
-                            )
                         finally:
                             db.close()
                 finally:
                     await client.close()
 
             elif sub_type == "deal.associationChange":
-                # Pre-fetch contact/company into DB if missing, then write the
-                # association edge. Pre-fetch must complete before the row is written.
                 await _ensure_associated_record_exists(event, hubspot_token)
                 db = SessionLocal()
                 try:
-                    _handle_association_change(db, event, source="webhook")
+                    _handle_association_change(db, event, evt_kwargs=evt_kwargs)
                     db.commit()
                 finally:
                     db.close()
 
-            # ── CONTACT — property change only ───────────────────────────────
-            # Only update if the contact already exists in our DB.
-            # If it doesn't exist yet it will be created on the next
-            # deal.associationChange pre-fetch, so there's nothing to do here.
-
+            # ── CONTACT property change ────────────────────────────────────────
             elif sub_type == "contact.propertyChange":
                 db = SessionLocal()
                 try:
-                    contact_exists = db.execute(
+                    exists = db.execute(
                         select(Contact).where(Contact.id == object_id)
                     ).scalar_one_or_none()
                 finally:
                     db.close()
 
-                if not contact_exists:
-                    logger.debug(
-                        "contact.propertyChange for %s — not in DB yet, skipping", object_id
-                    )
+                if not exists:
+                    # Only track contacts that are linked to our deals
                     processed += 1
                     continue
 
@@ -276,36 +370,29 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
                 try:
                     contact_data = await _fetch_single_contact(client, object_id)
                     if contact_data:
-                        props = contact_data.get("properties", {})
                         db = SessionLocal()
                         try:
-                            _upsert_contacts(db, {object_id: props}, change_source="webhook")
-                            db.commit()
-                            logger.info(
-                                "Updated contact %s via propertyChange webhook", object_id
+                            _upsert_contacts(
+                                db, {object_id: contact_data.get("properties", {})},
+                                change_source="webhook", evt_kwargs=evt_kwargs,
                             )
+                            db.commit()
                         finally:
                             db.close()
                 finally:
                     await client.close()
 
-            # ── COMPANY — property change only ───────────────────────────────
-            # Only update if the company already exists in our DB.
-            # Same logic as contact.propertyChange above.
-
+            # ── COMPANY property change ────────────────────────────────────────
             elif sub_type == "company.propertyChange":
                 db = SessionLocal()
                 try:
-                    company_exists = db.execute(
+                    exists = db.execute(
                         select(Company).where(Company.id == object_id)
                     ).scalar_one_or_none()
                 finally:
                     db.close()
 
-                if not company_exists:
-                    logger.debug(
-                        "company.propertyChange for %s — not in DB yet, skipping", object_id
-                    )
+                if not exists:
                     processed += 1
                     continue
 
@@ -313,49 +400,111 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
                 try:
                     company_data = await _fetch_single_company(client, object_id)
                     if company_data:
-                        props = company_data.get("properties", {})
                         db = SessionLocal()
                         try:
-                            _upsert_companies(db, {object_id: props}, change_source="webhook")
-                            db.commit()
-                            logger.info(
-                                "Updated company %s via propertyChange webhook", object_id
+                            _upsert_companies(
+                                db, {object_id: company_data.get("properties", {})},
+                                change_source="webhook", evt_kwargs=evt_kwargs,
                             )
+                            db.commit()
                         finally:
                             db.close()
                 finally:
                     await client.close()
 
-            # ── INTENTIONALLY IGNORED ─────────────────────────────────────────
+            # ── Intentionally ignored ─────────────────────────────────────────
             elif sub_type in (
-                "contact.creation",
+                "contact.creation", "contact.associationChange",
                 "contact.deletion",
-                "contact.associationChange",
-                "company.creation",
+                "company.creation", "company.associationChange",
                 "company.deletion",
-                "company.associationChange",
             ):
-                logger.debug(
-                    "Intentionally skipping %s (objectId=%s)", sub_type, object_id
-                )
+                logger.debug("Skipping %s (objectId=%s)", sub_type, object_id)
 
             else:
                 logger.warning("Unhandled subscriptionType: %s", sub_type)
 
             processed += 1
-            logger.info("Webhook processed: %s for objectId=%s", sub_type, object_id)
 
         except Exception as exc:
-            logger.error(
-                "Webhook error for eventId=%s: %s", event.eventId, exc, exc_info=True
-            )
+            logger.error("Webhook error eventId=%s: %s", event.eventId, exc, exc_info=True)
             errors.append(f"eventId={event.eventId} type={event.subscriptionType}: {exc}")
 
     return {"processed": processed, "errors": errors}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PRE-FETCH ASSOCIATED RECORD BEFORE WRITING ASSOCIATION ROW
+# SOFT DELETE — DEAL  (deals keep deleted_at/is_active; contacts/companies do not)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = None) -> None:
+    """
+    Soft-delete a deal and cascade-close all its active association rows.
+    Contact and company records themselves are NOT touched.
+    """
+    evt_kwargs = evt_kwargs or {}
+    now = now_ist()
+
+    deal: Optional[Deal] = db.execute(select(Deal).where(Deal.id == deal_id)).scalar_one_or_none()
+    owner = deal.hubspot_owner_id if deal else None
+
+    db.execute(
+        update(Deal).where(Deal.id == deal_id).values(
+            deleted_at=now, deleted_by=owner,
+            is_active=False, updated_at=now, updated_by=owner,
+        )
+    )
+    _write_audit(db, table_name="deals", record_id=deal_id,
+                 action="deal deleted", deal_id=deal_id,
+                 source="webhook_deletion", **evt_kwargs)
+
+    # Cascade: close all active DealContact rows
+    active_contacts = db.execute(
+        select(DealContact).where(
+            DealContact.deal_id == deal_id,
+            DealContact.deleted_at.is_(None),
+        )
+    ).scalars().all()
+    for dc in active_contacts:
+        _write_audit(db, table_name="deal_contacts", record_id=str(dc.id),
+                     action="contact removed", deal_id=deal_id,
+                     related_table="contacts", related_id=dc.contact_id,
+                     source="deal_deleted", **evt_kwargs)
+    if active_contacts:
+        db.execute(
+            update(DealContact)
+            .where(DealContact.deal_id == deal_id, DealContact.deleted_at.is_(None))
+            .values(deleted_at=now, updated_at=now)
+        )
+
+    # Cascade: close all active DealCompany rows
+    active_companies = db.execute(
+        select(DealCompany).where(
+            DealCompany.deal_id == deal_id,
+            DealCompany.deleted_at.is_(None),
+        )
+    ).scalars().all()
+    for dc in active_companies:
+        _write_audit(db, table_name="deal_companies", record_id=str(dc.id),
+                     action="company removed", deal_id=deal_id,
+                     related_table="companies", related_id=dc.company_id,
+                     source="deal_deleted", **evt_kwargs)
+    if active_companies:
+        db.execute(
+            update(DealCompany)
+            .where(DealCompany.deal_id == deal_id, DealCompany.deleted_at.is_(None))
+            .values(deleted_at=now, updated_at=now)
+        )
+
+    db.commit()
+    logger.info(
+        "deal %s soft-deleted — %d contact / %d company association(s) closed",
+        deal_id, len(active_contacts), len(active_companies),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRE-FETCH ASSOCIATED RECORD (before saving association)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _ensure_associated_record_exists(
@@ -363,25 +512,11 @@ async def _ensure_associated_record_exists(
     hubspot_token: str,
 ) -> None:
     """
-    Called before every deal.associationChange write.
-
-    When a deal is created with contacts/companies already linked, HubSpot fires
-    deal.associationChange events immediately — often before we have stored those
-    contact/company records.  This function checks the DB and fetches + inserts
-    any missing record so the association row can be written safely.
-
-    Scope:
-      • Only DEAL_TO_CONTACT and DEAL_TO_COMPANY directions.
-      • Skips removal events (associationRemoved=True) — no point fetching a
-        record that is being detached.
-      • Skips if the record already exists — no extra API call needed.
+    When a new association arrives, make sure the contact/company row exists in DB.
+    If not, fetch it from HubSpot and insert it.
     """
     a_type = event.associationType or ""
-
-    if event.associationRemoved:
-        return
-
-    if a_type not in ("DEAL_TO_CONTACT", "DEAL_TO_COMPANY"):
+    if event.associationRemoved or a_type not in ("DEAL_TO_CONTACT", "DEAL_TO_COMPANY"):
         return
 
     to_id = str(event.toObjectId) if event.toObjectId is not None else None
@@ -391,56 +526,27 @@ async def _ensure_associated_record_exists(
     db = SessionLocal()
     try:
         if a_type == "DEAL_TO_CONTACT":
-            exists = db.execute(
-                select(Contact).where(Contact.id == to_id)
-            ).scalar_one_or_none()
+            exists = db.execute(select(Contact).where(Contact.id == to_id)).scalar_one_or_none()
             if not exists:
-                logger.info(
-                    "Contact %s not in DB — fetching from HubSpot before association write",
-                    to_id,
-                )
                 client = HubSpotClient(access_token=hubspot_token)
                 try:
-                    contact_data = await _fetch_single_contact(client, to_id)
-                    if contact_data:
-                        props = contact_data.get("properties", {})
-                        _upsert_contacts(
-                            db, {to_id: props}, change_source="webhook_assoc_prefetch"
-                        )
+                    data = await _fetch_single_contact(client, to_id)
+                    if data:
+                        _upsert_contacts(db, {to_id: data.get("properties", {})},
+                                         change_source="webhook_assoc_prefetch")
                         db.commit()
-                    else:
-                        logger.warning(
-                            "Could not fetch contact %s from HubSpot — "
-                            "association row will be written without a contacts record",
-                            to_id,
-                        )
                 finally:
                     await client.close()
-
-        else:  # DEAL_TO_COMPANY
-            exists = db.execute(
-                select(Company).where(Company.id == to_id)
-            ).scalar_one_or_none()
+        else:
+            exists = db.execute(select(Company).where(Company.id == to_id)).scalar_one_or_none()
             if not exists:
-                logger.info(
-                    "Company %s not in DB — fetching from HubSpot before association write",
-                    to_id,
-                )
                 client = HubSpotClient(access_token=hubspot_token)
                 try:
-                    company_data = await _fetch_single_company(client, to_id)
-                    if company_data:
-                        props = company_data.get("properties", {})
-                        _upsert_companies(
-                            db, {to_id: props}, change_source="webhook_assoc_prefetch"
-                        )
+                    data = await _fetch_single_company(client, to_id)
+                    if data:
+                        _upsert_companies(db, {to_id: data.get("properties", {})},
+                                          change_source="webhook_assoc_prefetch")
                         db.commit()
-                    else:
-                        logger.warning(
-                            "Could not fetch company %s from HubSpot — "
-                            "association row will be written without a companies record",
-                            to_id,
-                        )
                 finally:
                     await client.close()
     finally:
@@ -454,227 +560,135 @@ async def _ensure_associated_record_exists(
 def _handle_association_change(
     db: Session,
     event: HubSpotWebhookEvent,
-    source: str = "webhook",
+    evt_kwargs: Optional[Dict] = None,
 ) -> None:
     """
-    Write a DealContact or DealCompany row based on a deal.associationChange event.
+    Handle deal.associationChange webhook.
 
-    Removal (associationRemoved=True):
-      Soft-delete all currently active rows for the (deal_id, contact/company_id)
-      pair by setting deleted_at=now.  Bulk update is safe — if there are none
-      it is a no-op.  deleted_at on those rows is then permanent.
-
-    Add / re-add (associationRemoved=False):
-      Look for an existing active row (deleted_at IS NULL) for the pair.
-        • Found  → update metadata in place (is_primary, portal_id, etc.)
-        • Not found → INSERT a brand-new row with a new surrogate PK.
-          Any previously soft-deleted rows for the same pair are LEFT UNTOUCHED —
-          deleted_at on those old rows is permanent, preserving full audit history.
-
-    Mirror directions (CONTACT_TO_DEAL, COMPANY_TO_DEAL) are skipped — the
-    DEAL_TO_* event for the same edge already handles the DB write.
-
-    Company removal note:
-      HubSpot sends TWO removal events when a company is removed: one with
-      isPrimaryAssociation=false (user action) and one with isPrimaryAssociation=true
-      (PRIMARY_AUTOMATION).  The bulk UPDATE WHERE deleted_at IS NULL handles this
-      safely — the second update finds zero matching active rows and is a no-op.
+    Writes "contact linked" / "contact removed" / "company linked" / "company removed"
+    to the audit log. Does NOT write internal HubSpot codes like CRM_UI or USER.
     """
+    evt_kwargs = evt_kwargs or {}
     a_type = event.associationType
-    if not a_type:
-        logger.warning(
-            "associationChange event %s has no associationType — skipping", event.eventId
-        )
-        return
 
-    # Skip mirror-direction events
-    if a_type in ("CONTACT_TO_DEAL", "COMPANY_TO_DEAL"):
-        logger.debug(
-            "Skipping mirror association event %s (type=%s)", event.eventId, a_type
-        )
+    # Skip reverse-direction events
+    if not a_type or a_type in ("CONTACT_TO_DEAL", "COMPANY_TO_DEAL"):
         return
 
     removed = bool(event.associationRemoved)
     is_primary = bool(event.isPrimaryAssociation)
     from_id = str(event.fromObjectId) if event.fromObjectId is not None else None
     to_id = str(event.toObjectId) if event.toObjectId is not None else None
-    portal_id = str(event.portalId)
-    now = datetime.utcnow()
+    portal_id = str(event.portalId) if event.portalId else None
+    now = now_ist()
 
-    # ── DEAL ↔ CONTACT ────────────────────────────────────────────────────────
     if a_type == "DEAL_TO_CONTACT":
         deal_id, contact_id = from_id, to_id
-
         if not deal_id or not contact_id:
-            logger.warning(
-                "associationChange %s missing IDs (from=%s to=%s) — skipping",
-                event.eventId, from_id, to_id,
-            )
             return
 
         if removed:
-            result = db.execute(
-                update(DealContact)
-                .where(
+            active_rows = db.execute(
+                select(DealContact).where(
                     DealContact.deal_id == deal_id,
                     DealContact.contact_id == contact_id,
                     DealContact.deleted_at.is_(None),
                 )
-                .values(deleted_at=now, updated_at=now, change_source=source)
+            ).scalars().all()
+            for row in active_rows:
+                _write_audit(
+                    db, table_name="deal_contacts", record_id=str(row.id),
+                    action="contact removed",
+                    deal_id=deal_id, related_table="contacts", related_id=contact_id,
+                    source="webhook_assoc", **evt_kwargs,
+                )
+            db.execute(
+                update(DealContact)
+                .where(DealContact.deal_id == deal_id,
+                       DealContact.contact_id == contact_id,
+                       DealContact.deleted_at.is_(None))
+                .values(deleted_at=now, updated_at=now)
             )
-            logger.info(
-                "ASSOC REMOVED: deal %s ↔ contact %s (%d row(s) soft-deleted)",
-                deal_id, contact_id, result.rowcount,
-            )
-
         else:
-            # Look for an existing ACTIVE row (deleted_at IS NULL)
             existing = db.query(DealContact).filter(
                 DealContact.deal_id == deal_id,
                 DealContact.contact_id == contact_id,
                 DealContact.deleted_at.is_(None),
             ).first()
-
             if existing:
-                # In-place update of metadata on the active row
-                existing.association_type = a_type
                 existing.is_primary = is_primary
                 existing.portal_id = portal_id
-                existing.change_source = source
                 existing.updated_at = now
-                logger.info(
-                    "ASSOC UPDATED: deal %s ↔ contact %s (primary=%s)",
-                    deal_id, contact_id, is_primary,
-                )
             else:
-                # No active row — insert a fresh one with a new PK.
-                # Old soft-deleted rows for the same pair are NOT touched.
-                db.add(DealContact(
-                    deal_id=deal_id,
-                    contact_id=contact_id,
-                    association_type=a_type,
-                    is_primary=is_primary,
-                    portal_id=portal_id,
-                    change_source=source,
-                    created_at=now,
-                    updated_at=now,
-                    deleted_at=None,
-                ))
-                logger.info(
-                    "ASSOC ADDED (new row): deal %s ↔ contact %s (primary=%s)",
-                    deal_id, contact_id, is_primary,
+                new_row = DealContact(
+                    deal_id=deal_id, contact_id=contact_id,
+                    association_type=a_type, is_primary=is_primary, portal_id=portal_id,
+                    created_at=now, updated_at=now, deleted_at=None,
+                )
+                db.add(new_row)
+                db.flush()
+                _write_audit(
+                    db, table_name="deal_contacts", record_id=str(new_row.id),
+                    action="contact linked",
+                    deal_id=deal_id, related_table="contacts", related_id=contact_id,
+                    source="webhook_assoc", **evt_kwargs,
                 )
 
-    # ── DEAL ↔ COMPANY ────────────────────────────────────────────────────────
     elif a_type == "DEAL_TO_COMPANY":
         deal_id, company_id = from_id, to_id
-
         if not deal_id or not company_id:
-            logger.warning(
-                "associationChange %s missing IDs (from=%s to=%s) — skipping",
-                event.eventId, from_id, to_id,
-            )
             return
 
         if removed:
-            result = db.execute(
-                update(DealCompany)
-                .where(
+            active_rows = db.execute(
+                select(DealCompany).where(
                     DealCompany.deal_id == deal_id,
                     DealCompany.company_id == company_id,
                     DealCompany.deleted_at.is_(None),
                 )
-                .values(deleted_at=now, updated_at=now, change_source=source)
+            ).scalars().all()
+            for row in active_rows:
+                _write_audit(
+                    db, table_name="deal_companies", record_id=str(row.id),
+                    action="company removed",
+                    deal_id=deal_id, related_table="companies", related_id=company_id,
+                    source="webhook_assoc", **evt_kwargs,
+                )
+            db.execute(
+                update(DealCompany)
+                .where(DealCompany.deal_id == deal_id,
+                       DealCompany.company_id == company_id,
+                       DealCompany.deleted_at.is_(None))
+                .values(deleted_at=now, updated_at=now)
             )
-            logger.info(
-                "ASSOC REMOVED: deal %s ↔ company %s (%d row(s) soft-deleted)",
-                deal_id, company_id, result.rowcount,
-            )
-
         else:
             existing = db.query(DealCompany).filter(
                 DealCompany.deal_id == deal_id,
                 DealCompany.company_id == company_id,
                 DealCompany.deleted_at.is_(None),
             ).first()
-
             if existing:
-                existing.association_type = a_type
                 existing.is_primary = is_primary
                 existing.portal_id = portal_id
-                existing.change_source = source
                 existing.updated_at = now
-                logger.info(
-                    "ASSOC UPDATED: deal %s ↔ company %s (primary=%s)",
-                    deal_id, company_id, is_primary,
-                )
             else:
-                # Fresh insert — old deleted rows for the same pair are preserved.
-                db.add(DealCompany(
-                    deal_id=deal_id,
-                    company_id=company_id,
-                    association_type=a_type,
-                    is_primary=is_primary,
-                    portal_id=portal_id,
-                    change_source=source,
-                    created_at=now,
-                    updated_at=now,
-                    deleted_at=None,
-                ))
-                logger.info(
-                    "ASSOC ADDED (new row): deal %s ↔ company %s (primary=%s)",
-                    deal_id, company_id, is_primary,
+                new_row = DealCompany(
+                    deal_id=deal_id, company_id=company_id,
+                    association_type=a_type, is_primary=is_primary, portal_id=portal_id,
+                    created_at=now, updated_at=now, deleted_at=None,
+                )
+                db.add(new_row)
+                db.flush()
+                _write_audit(
+                    db, table_name="deal_companies", record_id=str(new_row.id),
+                    action="company linked",
+                    deal_id=deal_id, related_table="companies", related_id=company_id,
+                    source="webhook_assoc", **evt_kwargs,
                 )
 
-    else:
-        logger.debug("Unhandled association type: %s — ignoring", a_type)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HUBSPOT API FETCH HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def _fetch_single_deal(client: HubSpotClient, deal_id: str) -> Optional[Dict]:
-    try:
-        data = await client.batch_read_objects("deals", [deal_id], DEAL_PROPERTIES)
-        results = data.get("results", [])
-        return results[0] if results else None
-    except Exception as exc:
-        logger.error("Failed to fetch deal %s: %s", deal_id, exc)
-        return None
-
-
-async def _fetch_single_contact(client: HubSpotClient, contact_id: str) -> Optional[Dict]:
-    try:
-        data = await client.batch_read_objects("contacts", [contact_id], CONTACT_PROPERTIES)
-        results = data.get("results", [])
-        return results[0] if results else None
-    except Exception as exc:
-        logger.error("Failed to fetch contact %s: %s", contact_id, exc)
-        return None
-
-
-async def _fetch_single_company(client: HubSpotClient, company_id: str) -> Optional[Dict]:
-    try:
-        data = await client.batch_read_objects("companies", [company_id], COMPANY_PROPERTIES)
-        results = data.get("results", [])
-        return results[0] if results else None
-    except Exception as exc:
-        logger.error("Failed to fetch company %s: %s", company_id, exc)
-        return None
-
-
-async def _get_stage_map(client: HubSpotClient) -> Dict[str, str]:
-    try:
-        data = await client.get_pipeline_stages("79964941")
-        return {stage["id"]: stage["label"] for stage in data.get("results", [])}
-    except Exception as exc:
-        logger.error("Failed to fetch stage map: %s", exc)
-        return {}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATABASE UPSERT HELPERS
+# UPSERT — DEALS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_deals(
@@ -682,118 +696,241 @@ def _upsert_deals(
     deals: Iterable[Dict],
     stage_map: Dict[str, str],
     change_source: str = "initial_load",
+    evt_kwargs: Optional[Dict] = None,
 ) -> None:
-    now = datetime.utcnow()
+    evt_kwargs = evt_kwargs or {}
+    now = now_ist()
+
     for deal in deals:
         props = deal.get("properties", {})
         deal_id = str(deal.get("id", ""))
         stage_id = _get_prop(props, "dealstage") or ""
-        db.merge(
-            Deal(
+        owner = _get_prop(props, "hubspot_owner_id")
+
+        new_values = {
+            "dealname": _get_prop(props, "dealname"),
+            "amount": _get_prop(props, "amount"),
+            "dealstage": stage_id,
+            "dealstage_label": stage_map.get(stage_id),
+            "closedate": _get_prop(props, "closedate"),
+            "pipeline": _get_prop(props, "pipeline"),
+            "dealtype": _get_prop(props, "dealtype"),
+            "description": _get_prop(props, "description"),
+            "hubspot_owner_id": owner,
+            "deal_owner_email": _get_prop(props, "deal_owner_email"),
+            "delivery_owner": _get_prop(props, "delivery_owner"),
+            "project_start_date": _get_prop(props, "project_start_date"),
+            "project_end_date": _get_prop(props, "project_end_date"),
+            "po_hours": _get_prop(props, "po_hours"),
+        }
+
+        existing: Optional[Deal] = db.execute(
+            select(Deal).where(Deal.id == deal_id)
+        ).scalar_one_or_none()
+
+        if existing is None:
+            new_deal = Deal(
                 id=deal_id,
                 hs_object_id=_get_prop(props, "hs_object_id") or deal_id,
-                dealname=_get_prop(props, "dealname"),
-                amount=_get_prop(props, "amount"),
-                dealstage=stage_id,
-                dealstage_label=stage_map.get(stage_id),
-                closedate=_get_prop(props, "closedate"),
                 createdate=_get_prop(props, "createdate"),
                 hs_lastmodifieddate=_get_prop(props, "hs_lastmodifieddate"),
-                hubspot_owner_id=_get_prop(props, "hubspot_owner_id"),
-                pipeline=_get_prop(props, "pipeline"),
-                deal_owner_email=_get_prop(props, "deal_owner_email"),
-                delivery_owner=_get_prop(props, "delivery_owner"),
-                project_start_date=_get_prop(props, "project_start_date"),
-                project_end_date=_get_prop(props, "project_end_date"),
-                po_hours=_get_prop(props, "po_hours"),
-                dealtype=_get_prop(props, "dealtype"),
-                description=_get_prop(props, "description"),
-                synced_at=now,
-                deleted_at=None,
+                portal_id=_get_prop(props, "portal_id"),
+                created_at=now, created_by=owner or change_source,
+                updated_at=now, updated_by=owner or change_source,
+                is_active=True, deleted_at=None,
+                **new_values,
             )
-        )
+            db.add(new_deal)
+            db.flush()
+            _write_audit(
+                db, table_name="deals", record_id=deal_id,
+                action="deal created",
+                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
+                deal_id=deal_id, source=change_source, **evt_kwargs,
+            )
+        else:
+            diff = _diff_fields(existing, new_values, _DEAL_AUDIT_FIELDS)
+            existing.hs_object_id = _get_prop(props, "hs_object_id") or deal_id
+            existing.hs_lastmodifieddate = _get_prop(props, "hs_lastmodifieddate")
+            existing.updated_at = now
+            existing.updated_by = owner or change_source
+            existing.deleted_at = None
+            existing.is_active = True
+            for f, v in new_values.items():
+                setattr(existing, f, v)
+            if diff:
+                _write_audit(
+                    db, table_name="deals", record_id=deal_id,
+                    action="deal updated",
+                    changed_fields=diff, deal_id=deal_id,
+                    source=change_source, **evt_kwargs,
+                )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPSERT — CONTACTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_contacts(
     db: Session,
     contacts_map: Dict[str, Dict],
     change_source: str = "initial_load",
+    evt_kwargs: Optional[Dict] = None,
 ) -> None:
-    now = datetime.utcnow()
+    """
+    Upsert contacts.
+    On update: write "contact updated" audit on the contacts table.
+    Also write "contact updated" on each active deal_contacts row so the change
+    is visible when querying audit by deal_id.
+    """
+    evt_kwargs = evt_kwargs or {}
+
     for contact_id, props in contacts_map.items():
         cid = str(contact_id)
-        db.merge(
-            Contact(
+
+        new_values = {
+            "email": _get_prop(props, "email"),
+            "firstname": _get_prop(props, "firstname"),
+            "lastname": _get_prop(props, "lastname"),
+            "hubspot_owner_id": _get_prop(props, "hubspot_owner_id"),
+            "jobtitle": _get_prop(props, "jobtitle"),
+            "phone": _get_prop(props, "phone"),
+            "lifecyclestage": _get_prop(props, "lifecyclestage"),
+            "lead_status": _get_prop(props, "hs_lead_status"),
+        }
+
+        existing: Optional[Contact] = db.execute(
+            select(Contact).where(Contact.id == cid)
+        ).scalar_one_or_none()
+
+        if existing is None:
+            db.add(Contact(
                 id=cid,
                 hs_object_id=_get_prop(props, "hs_object_id") or cid,
-                email=_get_prop(props, "email"),
-                firstname=_get_prop(props, "firstname"),
-                lastname=_get_prop(props, "lastname"),
-                phone=_get_prop(props, "phone"),
-                mobilephone=_get_prop(props, "mobilephone"),
-                city=_get_prop(props, "city"),
-                country=_get_prop(props, "country"),
-                company=_get_prop(props, "company"),
-                closedate=_get_prop(props, "closedate"),
                 createdate=_get_prop(props, "createdate"),
                 lastmodifieddate=_get_prop(props, "lastmodifieddate"),
-                synced_at=now,
-                deleted_at=None,
+                **new_values,
+            ))
+            db.flush()
+            _write_audit(
+                db, table_name="contacts", record_id=cid,
+                action="contact created",
+                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
+                source=change_source, **evt_kwargs,
             )
-        )
+        else:
+            diff = _diff_fields(existing, new_values, _CONTACT_AUDIT_FIELDS)
+            existing.hs_object_id = _get_prop(props, "hs_object_id") or cid
+            existing.lastmodifieddate = _get_prop(props, "lastmodifieddate")
+            for f, v in new_values.items():
+                setattr(existing, f, v)
 
+            if diff:
+                # Primary audit entry on the contact itself
+                _write_audit(
+                    db, table_name="contacts", record_id=cid,
+                    action="contact updated",
+                    changed_fields=diff, source=change_source, **evt_kwargs,
+                )
+                # Mirror onto every active deal link so it surfaces in deal-scoped audit queries
+                active_links = db.execute(
+                    select(DealContact).where(
+                        DealContact.contact_id == cid,
+                        DealContact.deleted_at.is_(None),
+                    )
+                ).scalars().all()
+                for dc in active_links:
+                    _write_audit(
+                        db, table_name="deal_contacts", record_id=str(dc.id),
+                        action="contact updated",
+                        changed_fields=diff,
+                        deal_id=dc.deal_id, related_table="contacts", related_id=cid,
+                        source=change_source, **evt_kwargs,
+                    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPSERT — COMPANIES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _upsert_companies(
     db: Session,
     companies_map: Dict[str, Dict],
     change_source: str = "initial_load",
+    evt_kwargs: Optional[Dict] = None,
 ) -> None:
-    now = datetime.utcnow()
+    """
+    Upsert companies.
+    On update: write "company updated" audit on the companies table.
+    Also write "company updated" on each active deal_companies row.
+    """
+    evt_kwargs = evt_kwargs or {}
+
     for company_id, props in companies_map.items():
         cid = str(company_id)
-        db.merge(
-            Company(
+
+        new_values = {
+            "domain": _get_prop(props, "domain"),
+            "name": _get_prop(props, "name"),
+            "hubspot_owner_id": _get_prop(props, "hubspot_owner_id"),
+            "industry": _get_prop(props, "industry"),
+            "company_type": _get_prop(props, "type"),
+            "city": _get_prop(props, "city"),
+            "state": _get_prop(props, "state"),
+            "postal_code": _get_prop(props, "zip"),
+            "number_of_employees": _get_prop(props, "numberofemployees"),
+            "annual_revenue": _get_prop(props, "annualrevenue"),
+            "timezone": _get_prop(props, "timezone"),
+            "description": _get_prop(props, "description"),
+            "linkedin_company_page": _get_prop(props, "linkedin_company_page"),
+        }
+
+        existing: Optional[Company] = db.execute(
+            select(Company).where(Company.id == cid)
+        ).scalar_one_or_none()
+
+        if existing is None:
+            db.add(Company(
                 id=cid,
                 hs_object_id=_get_prop(props, "hs_object_id") or cid,
-                name=_get_prop(props, "name"),
-                domain=_get_prop(props, "domain"),
-                industry=_get_prop(props, "industry"),
-                city=_get_prop(props, "city"),
-                country=_get_prop(props, "country"),
                 createdate=_get_prop(props, "createdate"),
                 hs_lastmodifieddate=_get_prop(props, "hs_lastmodifieddate"),
-                synced_at=now,
-                deleted_at=None,
+                **new_values,
+            ))
+            db.flush()
+            _write_audit(
+                db, table_name="companies", record_id=cid,
+                action="company created",
+                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
+                source=change_source, **evt_kwargs,
             )
-        )
+        else:
+            diff = _diff_fields(existing, new_values, _COMPANY_AUDIT_FIELDS)
+            existing.hs_object_id = _get_prop(props, "hs_object_id") or cid
+            existing.hs_lastmodifieddate = _get_prop(props, "hs_lastmodifieddate")
+            for f, v in new_values.items():
+                setattr(existing, f, v)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SOFT DELETE HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _soft_delete_deal(db: Session, deal_id: str) -> None:
-    """
-    Soft-delete a deal and cascade to all its active association rows.
-    Contact and company records themselves are NOT deleted — they may be
-    linked to other deals that are still active.
-    """
-    now = datetime.utcnow()
-    db.execute(
-        update(Deal).where(Deal.id == deal_id).values(deleted_at=now, synced_at=now)
-    )
-    db.execute(
-        update(DealContact)
-        .where(DealContact.deal_id == deal_id, DealContact.deleted_at.is_(None))
-        .values(deleted_at=now, updated_at=now, change_source="webhook_deletion")
-    )
-    db.execute(
-        update(DealCompany)
-        .where(DealCompany.deal_id == deal_id, DealCompany.deleted_at.is_(None))
-        .values(deleted_at=now, updated_at=now, change_source="webhook_deletion")
-    )
-    db.commit()
-    logger.info("Soft-deleted deal %s and all its active associations", deal_id)
+            if diff:
+                _write_audit(
+                    db, table_name="companies", record_id=cid,
+                    action="company updated",
+                    changed_fields=diff, source=change_source, **evt_kwargs,
+                )
+                active_links = db.execute(
+                    select(DealCompany).where(
+                        DealCompany.company_id == cid,
+                        DealCompany.deleted_at.is_(None),
+                    )
+                ).scalars().all()
+                for dc in active_links:
+                    _write_audit(
+                        db, table_name="deal_companies", record_id=str(dc.id),
+                        action="company updated",
+                        changed_fields=diff,
+                        deal_id=dc.deal_id, related_table="companies", related_id=cid,
+                        source=change_source, **evt_kwargs,
+                    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -820,117 +957,144 @@ def persist_load_data(
 
 
 def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> None:
-    """
-    Initial load: sync associations without creating duplicate rows.
-    - Active row still in HubSpot  → touch updated_at only (no new row)
-    - New association               → insert fresh row
-    - Active row gone from HubSpot → soft-delete
-    - Previously soft-deleted row  → leave untouched (audit trail preserved)
-    """
-    now = datetime.utcnow()
-
+    now = now_ist()
     for deal_id, contact_ids in contact_assoc.items():
         incoming = {str(c) for c in contact_ids}
-
-        # Fetch all currently active rows for this deal
         active_rows: List[DealContact] = db.query(DealContact).filter(
             DealContact.deal_id == str(deal_id),
             DealContact.deleted_at.is_(None),
         ).all()
-
         active_map = {row.contact_id: row for row in active_rows}
-        active_ids = set(active_map.keys())
 
-        # Soft-delete rows no longer in HubSpot
-        for contact_id in active_ids - incoming:
+        for contact_id in set(active_map) - incoming:
             row = active_map[contact_id]
             row.deleted_at = now
             row.updated_at = now
-            row.change_source = "initial_load_replace"
+            _write_audit(db, table_name="deal_contacts", record_id=str(row.id),
+                         action="contact removed", deal_id=str(deal_id),
+                         related_table="contacts", related_id=contact_id,
+                         source="initial_load_replace")
 
-        # Update existing or insert new
         for contact_id in incoming:
             if contact_id in active_map:
-                # Already active — just refresh the timestamp, no new row
                 active_map[contact_id].updated_at = now
-                active_map[contact_id].change_source = "initial_load"
             else:
-                # Not active (either brand new or was previously deleted)
-                # Always insert a fresh row — old deleted rows stay untouched
-                db.add(DealContact(
-                    deal_id=str(deal_id),
-                    contact_id=contact_id,
+                new_row = DealContact(
+                    deal_id=str(deal_id), contact_id=contact_id,
                     association_type="DEAL_TO_CONTACT",
-                    change_source="initial_load",
-                    created_at=now,
-                    updated_at=now,
-                    deleted_at=None,
-                ))
+                    created_at=now, updated_at=now, deleted_at=None,
+                )
+                db.add(new_row)
+                db.flush()
+                _write_audit(db, table_name="deal_contacts", record_id=str(new_row.id),
+                             action="contact linked", deal_id=str(deal_id),
+                             related_table="contacts", related_id=contact_id,
+                             source="initial_load")
 
 
 def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) -> None:
-    """
-    Same sync logic as _replace_deal_contacts but for DealCompany rows.
-    """
-    now = datetime.utcnow()
-
+    now = now_ist()
     for deal_id, company_ids in company_assoc.items():
         incoming = {str(c) for c in company_ids}
-
         active_rows: List[DealCompany] = db.query(DealCompany).filter(
             DealCompany.deal_id == str(deal_id),
             DealCompany.deleted_at.is_(None),
         ).all()
-
         active_map = {row.company_id: row for row in active_rows}
-        active_ids = set(active_map.keys())
 
-        # Soft-delete rows no longer in HubSpot
-        for company_id in active_ids - incoming:
+        for company_id in set(active_map) - incoming:
             row = active_map[company_id]
             row.deleted_at = now
             row.updated_at = now
-            row.change_source = "initial_load_replace"
+            _write_audit(db, table_name="deal_companies", record_id=str(row.id),
+                         action="company removed", deal_id=str(deal_id),
+                         related_table="companies", related_id=company_id,
+                         source="initial_load_replace")
 
-        # Update existing or insert new
         for company_id in incoming:
             if company_id in active_map:
                 active_map[company_id].updated_at = now
-                active_map[company_id].change_source = "initial_load"
             else:
-                db.add(DealCompany(
-                    deal_id=str(deal_id),
-                    company_id=company_id,
+                new_row = DealCompany(
+                    deal_id=str(deal_id), company_id=company_id,
                     association_type="DEAL_TO_COMPANY",
-                    change_source="initial_load",
-                    created_at=now,
-                    updated_at=now,
-                    deleted_at=None,
-                ))
+                    created_at=now, updated_at=now, deleted_at=None,
+                )
+                db.add(new_row)
+                db.flush()
+                _write_audit(db, table_name="deal_companies", record_id=str(new_row.id),
+                             action="company linked", deal_id=str(deal_id),
+                             related_table="companies", related_id=company_id,
+                             source="initial_load")
+
 
 def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
     deal_ids = list(attachments_map.keys())
     for chunk in _chunk_list(deal_ids, 500):
         db.execute(delete(Attachment).where(Attachment.deal_id.in_(chunk)))
-
+    now = now_ist()
     rows = []
     for deal_id, attachments in attachments_map.items():
-        for attachment in attachments:
-            rows.append(
-                Attachment(
-                    deal_id=str(attachment.get("deal_id", deal_id)),
-                    note_id=str(attachment.get("note_id", "")),
-                    file_id=str(attachment.get("file_id", "")),
-                )
-            )
+        for att in attachments:
+            rows.append(Attachment(
+                deal_id=str(att.get("deal_id", deal_id)),
+                note_id=str(att.get("note_id", "")),
+                file_id=str(att.get("file_id", "")),
+                created_at=now, created_by="initial_load",
+                updated_at=now, updated_by="initial_load",
+                is_active=True,
+            ))
     db.add_all(rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JOB DB HELPERS
+# HUBSPOT API FETCH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def create_job(db: Session, job_id: str, started_at: datetime) -> Job:
+async def _fetch_single_deal(client: HubSpotClient, deal_id: str) -> Optional[Dict]:
+    try:
+        data = await client.batch_read_objects("deals", [deal_id], DEAL_PROPERTIES)
+        results = data.get("results", [])
+        return results[0] if results else None
+    except Exception as exc:
+        logger.error("fetch deal %s failed: %s", deal_id, exc)
+        return None
+
+
+async def _fetch_single_contact(client: HubSpotClient, contact_id: str) -> Optional[Dict]:
+    try:
+        data = await client.batch_read_objects("contacts", [contact_id], CONTACT_PROPERTIES)
+        results = data.get("results", [])
+        return results[0] if results else None
+    except Exception as exc:
+        logger.error("fetch contact %s failed: %s", contact_id, exc)
+        return None
+
+
+async def _fetch_single_company(client: HubSpotClient, company_id: str) -> Optional[Dict]:
+    try:
+        data = await client.batch_read_objects("companies", [company_id], COMPANY_PROPERTIES)
+        results = data.get("results", [])
+        return results[0] if results else None
+    except Exception as exc:
+        logger.error("fetch company %s failed: %s", company_id, exc)
+        return None
+
+
+async def _get_stage_map(client: HubSpotClient) -> Dict[str, str]:
+    try:
+        data = await client.get_pipeline_stages("79964941")
+        return {s["id"]: s["label"] for s in data.get("results", [])}
+    except Exception as exc:
+        logger.error("fetch stage map failed: %s", exc)
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_job(db: Session, job_id: str, started_at) -> Job:
     job = Job(job_id=job_id, status=LoadStatus.RUNNING.value, started_at=started_at)
     db.add(job)
     db.commit()
@@ -940,9 +1104,8 @@ def create_job(db: Session, job_id: str, started_at: datetime) -> Job:
 def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -> Job:
     job = db.execute(select(Job).where(Job.job_id == job_id)).scalar_one_or_none()
     if not job:
-        job = Job(job_id=job_id, started_at=datetime.utcnow())
+        job = Job(job_id=job_id, started_at=now_ist())
         db.add(job)
-
     job.status = progress.status.value
     job.pages_processed = progress.pages_processed
     job.deals_fetched = progress.deals_fetched
@@ -954,8 +1117,8 @@ def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -
     job.errors_json = json.dumps(progress.errors)
     job.result_sample_json = json.dumps(progress.result_sample)
     if progress.completed_at:
+        from datetime import datetime
         job.completed_at = datetime.fromisoformat(progress.completed_at)
-
     db.commit()
     return job
 
@@ -973,4 +1136,4 @@ def _get_prop(props: Dict, key: str) -> Optional[str]:
     if value is None:
         return None
     s = str(value).strip()
-    return s if s else None
+    return s or None

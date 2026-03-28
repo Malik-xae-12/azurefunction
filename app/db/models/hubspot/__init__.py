@@ -4,6 +4,7 @@ from app.db.models.hubspot.company import Company
 from app.db.models.hubspot.contact import Contact
 from app.db.models.hubspot.deal import Deal
 from app.db.models.hubspot.job import Job
+from app.db.models.hubspot.audit_log import AuditLog
 
 __all__ = [
     "Attachment",
@@ -13,4 +14,5 @@ __all__ = [
     "DealCompany",
     "DealContact",
     "Job",
+    "AuditLog",
 ]
