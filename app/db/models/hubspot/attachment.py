@@ -1,4 +1,4 @@
-"""Attachment ORM model — tracks files attached to deals via HubSpot notes."""
+"""Attachment ORM model — tracks files attached to deals via HubSpot proposalattachments property."""
 
 from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, UniqueConstraint
 from sqlalchemy.sql import func
@@ -12,7 +12,6 @@ class Attachment(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     deal_id = Column(String(64), nullable=False)
-    note_id = Column(String(64), nullable=False)
     file_id = Column(String(64), nullable=False)
 
     # ── File metadata from HubSpot ───────────────────────────────────────────
@@ -46,7 +45,7 @@ class Attachment(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("deal_id", "note_id", "file_id", name="uq_attachment"),
+        UniqueConstraint("deal_id", "file_id", name="uq_attachment_deal_file"),
         Index("ix_attachments_deal_id", "deal_id"),
         Index("ix_attachments_deleted_at", "deleted_at"),
         Index("ix_attachments_is_active", "is_active"),

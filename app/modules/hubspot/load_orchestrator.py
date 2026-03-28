@@ -78,7 +78,13 @@ class LoadOrchestrator:
             yield self._progress
 
             # ── Phase 4: Attachments per deal ─────────────────────────────────
-            attachment_tasks = [self._fetch_deal_attachments(d["id"]) for d in all_deals]
+            attachment_tasks = [
+                self._fetch_deal_attachments(
+                    d["id"],
+                    d.get("properties", {}).get("proposalattachments", ""),
+                )
+                for d in all_deals
+            ]
             attachment_results = await asyncio.gather(*attachment_tasks, return_exceptions=True)
 
             total_attachments = 0
@@ -185,41 +191,19 @@ class LoadOrchestrator:
         await asyncio.gather(*[fetch_chunk(c) for c in chunks])
         return records_map
 
-    async def _fetch_deal_attachments(self, deal_id: str) -> List[Dict]:
-        async with self._sem:
-            data = await self.client.get_deal_attachments(deal_id)
-            self._progress.api_calls_made += 1
-
-        note_ids = [r["id"] for r in data.get("results", [])]
-        if not note_ids:
+    async def _fetch_deal_attachments(self, deal_id: str, proposalattachments_raw: str) -> List[Dict]:
+        """Parse file IDs from proposalattachments property and fetch metadata."""
+        if not proposalattachments_raw:
             return []
 
-        fetch_tasks = [self._fetch_note_attachments(nid, deal_id) for nid in note_ids[:50]]
-        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-
-        attachment_details = []
-        for r in results:
-            if not isinstance(r, Exception) and r:
-                attachment_details.extend(r)
-        return attachment_details
-
-    async def _fetch_note_attachments(self, note_id: str, deal_id: str) -> List[Dict]:
-        async with self._sem:
-            data = await self.client.get_engagement_attachments(note_id)
-            self._progress.api_calls_made += 1
-
-        props = data.get("properties", {})
-        attachment_ids_raw = props.get("hs_attachment_ids", "")
-        if not attachment_ids_raw:
-            return []
-
-        attachment_ids = [a.strip() for a in attachment_ids_raw.split(";") if a.strip()]
+        file_ids = [fid.strip() for fid in proposalattachments_raw.split(";") if fid.strip()]
         results = []
-        for fid in attachment_ids:
-            entry: Dict[str, Any] = {"deal_id": deal_id, "note_id": note_id, "file_id": fid}
+        for fid in file_ids:
+            entry: Dict[str, Any] = {"deal_id": deal_id, "file_id": fid}
             try:
-                meta = await self.client.get_file_metadata(fid)
-                self._progress.api_calls_made += 1
+                async with self._sem:
+                    meta = await self.client.get_file_metadata(fid)
+                    self._progress.api_calls_made += 1
                 if meta:
                     entry["file_name"] = meta.get("name")
                     entry["file_url"] = meta.get("url")

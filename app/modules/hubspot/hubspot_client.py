@@ -156,21 +156,6 @@ class HubSpotClient:
             json_body=body,
         )
 
-    async def get_deal_attachments(self, deal_id: str) -> Dict:
-        """GET /crm/v3/objects/deals/{id}/associations/notes"""
-        return await self._request(
-            "GET",
-            f"/crm/v3/objects/deals/{deal_id}/associations/notes",
-        )
-
-    async def get_engagement_attachments(self, engagement_id: str) -> Dict:
-        """Fetch full note/engagement to get file IDs."""
-        return await self._request(
-            "GET",
-            f"/crm/v3/objects/notes/{engagement_id}",
-            params={"properties": "hs_attachment_ids,hs_note_body"},
-        )
-
     async def get_pipeline_stages(self, pipeline_id: str) -> Dict:
         """GET /crm/v3/pipelines/deals/{pipeline_id}/stages"""
         return await self._request(
