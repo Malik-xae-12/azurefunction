@@ -214,7 +214,20 @@ class LoadOrchestrator:
             return []
 
         attachment_ids = [a.strip() for a in attachment_ids_raw.split(";") if a.strip()]
-        return [{"deal_id": deal_id, "note_id": note_id, "file_id": fid} for fid in attachment_ids]
+        results = []
+        for fid in attachment_ids:
+            entry: Dict[str, Any] = {"deal_id": deal_id, "note_id": note_id, "file_id": fid}
+            try:
+                meta = await self.client.get_file_metadata(fid)
+                self._progress.api_calls_made += 1
+                if meta:
+                    entry["file_name"] = meta.get("name")
+                    entry["file_url"] = meta.get("url")
+                    entry["file_type"] = meta.get("type") or meta.get("extension")
+            except Exception as exc:
+                logger.warning("File metadata fetch failed for %s: %s", fid, exc)
+            results.append(entry)
+        return results
 
     async def _fetch_stage_map(self, pipeline_id: str) -> Dict[str, str]:
         """Returns {stage_id: stage_label}"""

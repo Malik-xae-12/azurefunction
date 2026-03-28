@@ -177,3 +177,10 @@ class HubSpotClient:
             "GET",
             f"/crm/v3/pipelines/deals/default/stages",
         )
+
+    async def get_file_metadata(self, file_id: str) -> Optional[Dict]:
+        """GET /files/v3/files/{fileId} — fetch file name, URL, type."""
+        try:
+            return await self._request("GET", f"/files/v3/files/{file_id}")
+        except Exception:
+            return None

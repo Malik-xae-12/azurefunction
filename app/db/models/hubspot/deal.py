@@ -39,6 +39,12 @@ class Deal(Base):
     project_end_date = Column(String(32), nullable=True)
     po_hours = Column(String(32), nullable=True)
 
+    # ── Custom fields ─────────────────────────────────────────────────────────
+    proposal = Column(
+        String(64), nullable=True,
+        comment="Custom HubSpot property: new proposal attached | proposal removed",
+    )
+
     # ── Audit columns (all IST) ───────────────────────────────────────────────
     created_at = Column(
         DateTime(timezone=True),

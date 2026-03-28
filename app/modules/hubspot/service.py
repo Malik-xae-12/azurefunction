@@ -67,6 +67,7 @@ DEAL_PROPERTIES = [
     "hubspot_owner_id", "deal_owner_email", "delivery_owner",
     "project_start_date", "project_end_date", "po_hours",
     "dealtype", "description", "createdate", "hs_lastmodifieddate", "hs_object_id",
+    "proposal",
 ]
 CONTACT_PROPERTIES = [
     "email", "firstname", "lastname", "hubspot_owner_id",
@@ -85,7 +86,7 @@ _DEAL_AUDIT_FIELDS = {
     "dealname", "amount", "dealstage", "dealstage_label", "closedate",
     "pipeline", "dealtype", "description", "hubspot_owner_id",
     "deal_owner_email", "delivery_owner", "project_start_date",
-    "project_end_date", "po_hours",
+    "project_end_date", "po_hours", "proposal",
 }
 _CONTACT_AUDIT_FIELDS = {
     "email", "firstname", "lastname", "hubspot_owner_id",
@@ -338,6 +339,11 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
                             db.commit()
                         finally:
                             db.close()
+
+                    # When proposal property changes, fetch & upsert attachments for this deal
+                    if event.propertyName == "proposal":
+                        await _sync_deal_attachments(client, object_id, event.propertyValue)
+
                 finally:
                     await client.close()
 
@@ -712,6 +718,7 @@ def _upsert_deals(
             "project_start_date": _get_prop(props, "project_start_date"),
             "project_end_date": _get_prop(props, "project_end_date"),
             "po_hours": _get_prop(props, "po_hours"),
+            "proposal": _get_prop(props, "proposal"),
         }
 
         existing: Optional[Deal] = db.execute(
@@ -1019,11 +1026,118 @@ def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
                 deal_id=str(att.get("deal_id", deal_id)),
                 note_id=str(att.get("note_id", "")),
                 file_id=str(att.get("file_id", "")),
-                created_at=now, created_by="initial_load",
-                updated_at=now, updated_by="initial_load",
+                file_name=att.get("file_name"),
+                file_url=att.get("file_url"),
+                file_type=att.get("file_type"),
+                created_at=now,
+                updated_at=now,
                 is_active=True,
             ))
     db.add_all(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROPOSAL → ATTACHMENT SYNC
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _sync_deal_attachments(
+    client: HubSpotClient, deal_id: str, proposal_value: Optional[str] = None,
+) -> None:
+    """
+    Fetch all attachments for a deal from HubSpot and reconcile with DB.
+
+    - 'new proposal attached'  → upsert files (create new / update existing)
+    - 'proposal removed'       → fetch files, soft-delete DB records not in HubSpot
+    """
+    is_removal = proposal_value and "removed" in str(proposal_value).lower()
+
+    try:
+        # Step 1: Get notes associated with the deal
+        assoc_data = await client.get_deal_attachments(deal_id)
+        note_ids = [r["id"] for r in assoc_data.get("results", [])]
+
+        # Step 2: Get file IDs from each note
+        all_files: List[Dict] = []
+        for note_id in note_ids[:50]:
+            try:
+                note_data = await client.get_engagement_attachments(note_id)
+                props = note_data.get("properties", {})
+                attachment_ids_raw = props.get("hs_attachment_ids", "")
+                if not attachment_ids_raw:
+                    continue
+                file_ids = [a.strip() for a in attachment_ids_raw.split(";") if a.strip()]
+                for fid in file_ids:
+                    all_files.append({"deal_id": deal_id, "note_id": note_id, "file_id": fid})
+            except Exception as exc:
+                logger.warning("deal %s note %s: failed to fetch attachments: %s", deal_id, note_id, exc)
+
+        # Step 3: Fetch file metadata from HubSpot Files API
+        for file_entry in all_files:
+            meta = await client.get_file_metadata(file_entry["file_id"])
+            if meta:
+                file_entry["file_name"] = meta.get("name")
+                file_entry["file_url"] = meta.get("url")
+                file_entry["file_type"] = meta.get("type") or meta.get("extension")
+
+        hubspot_file_ids = {str(f["file_id"]) for f in all_files}
+
+        # Step 4: DB operations
+        now = now_ist()
+        db = SessionLocal()
+        try:
+            if is_removal:
+                # Soft-delete DB attachments whose file_id is no longer in HubSpot
+                db_attachments = db.query(Attachment).filter(
+                    Attachment.deal_id == str(deal_id),
+                    Attachment.is_active == True,
+                ).all()
+                deleted_count = 0
+                for att in db_attachments:
+                    if att.file_id not in hubspot_file_ids:
+                        att.deleted_at = now
+                        att.updated_at = now
+                        att.is_active = False
+                        deleted_count += 1
+                db.commit()
+                logger.info("deal %s: proposal removed – soft-deleted %d attachment(s)", deal_id, deleted_count)
+            else:
+                # Upsert: create new / update existing
+                if not all_files:
+                    logger.info("deal %s: no file attachments found to upsert", deal_id)
+                    return
+                for f in all_files:
+                    existing = db.query(Attachment).filter(
+                        Attachment.deal_id == str(f["deal_id"]),
+                        Attachment.note_id == str(f["note_id"]),
+                        Attachment.file_id == str(f["file_id"]),
+                    ).first()
+
+                    if existing:
+                        existing.file_name = f.get("file_name")
+                        existing.file_url = f.get("file_url")
+                        existing.file_type = f.get("file_type")
+                        existing.updated_at = now
+                        existing.is_active = True
+                        existing.deleted_at = None
+                    else:
+                        db.add(Attachment(
+                            deal_id=str(f["deal_id"]),
+                            note_id=str(f["note_id"]),
+                            file_id=str(f["file_id"]),
+                            file_name=f.get("file_name"),
+                            file_url=f.get("file_url"),
+                            file_type=f.get("file_type"),
+                            created_at=now,
+                            updated_at=now,
+                            is_active=True,
+                        ))
+                db.commit()
+                logger.info("deal %s: upserted %d attachment(s)", deal_id, len(all_files))
+        finally:
+            db.close()
+
+    except Exception as exc:
+        logger.error("deal %s: attachment sync failed: %s", deal_id, exc, exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
