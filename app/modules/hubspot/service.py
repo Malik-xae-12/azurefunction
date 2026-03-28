@@ -342,7 +342,7 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
 
                     # When proposalattachments property changes, sync attachments for this deal
                     if event.propertyName == "proposalattachments":
-                        await _sync_deal_attachments(client, object_id, event.propertyValue)
+                        await _sync_deal_attachments(client, object_id, event.propertyValue, evt_kwargs)
 
                 finally:
                     await client.close()
@@ -1040,6 +1040,7 @@ def _replace_attachments(db: Session, attachments_map: Dict[str, List]) -> None:
 
 async def _sync_deal_attachments(
     client: HubSpotClient, deal_id: str, property_value: Optional[str] = None,
+    evt_kwargs: Optional[Dict] = None,
 ) -> None:
     """
     Reconcile attachments for a deal based on the proposalattachments
@@ -1083,6 +1084,8 @@ async def _sync_deal_attachments(
 
             upserted = 0
             deleted = 0
+            added_files = []
+            removed_files = []
 
             # Upsert files that are in HubSpot
             for fid in hubspot_file_ids:
@@ -1093,6 +1096,8 @@ async def _sync_deal_attachments(
                     existing.file_url = meta.get("file_url")
                     existing.file_type = meta.get("file_type")
                     existing.updated_at = now
+                    if not existing.is_active:
+                        added_files.append(meta.get("file_name") or fid)
                     existing.is_active = True
                     existing.deleted_at = None
                 else:
@@ -1106,6 +1111,7 @@ async def _sync_deal_attachments(
                         updated_at=now,
                         is_active=True,
                     ))
+                    added_files.append(meta.get("file_name") or fid)
                 upserted += 1
 
             # Soft-delete files in DB but no longer in HubSpot
@@ -1115,6 +1121,22 @@ async def _sync_deal_attachments(
                     att.updated_at = now
                     att.is_active = False
                     deleted += 1
+                    removed_files.append(att.file_name or fid)
+
+            # Write audit log entry
+            if added_files or removed_files:
+                changed = {}
+                if added_files:
+                    changed["attachments_added"] = added_files
+                if removed_files:
+                    changed["attachments_removed"] = removed_files
+                kw = evt_kwargs or {}
+                _write_audit(
+                    db, table_name="deals", record_id=deal_id,
+                    action="deal updated",
+                    changed_fields=changed,
+                    source="webhook", **kw,
+                )
 
             db.commit()
             logger.info(
