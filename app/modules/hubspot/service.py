@@ -450,8 +450,8 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
 
     db.execute(
         update(Deal).where(Deal.id == deal_id).values(
-            deleted_at=now, deleted_by=owner,
-            is_active=False, updated_at=now, updated_by=owner,
+            deleted_at=now,
+            is_active=False, updated_at=now,
         )
     )
     _write_audit(db, table_name="deals", record_id=deal_id,
@@ -579,7 +579,6 @@ def _handle_association_change(
     is_primary = bool(event.isPrimaryAssociation)
     from_id = str(event.fromObjectId) if event.fromObjectId is not None else None
     to_id = str(event.toObjectId) if event.toObjectId is not None else None
-    portal_id = str(event.portalId) if event.portalId else None
     now = now_ist()
 
     if a_type == "DEAL_TO_CONTACT":
@@ -617,12 +616,11 @@ def _handle_association_change(
             ).first()
             if existing:
                 existing.is_primary = is_primary
-                existing.portal_id = portal_id
                 existing.updated_at = now
             else:
                 new_row = DealContact(
                     deal_id=deal_id, contact_id=contact_id,
-                    association_type=a_type, is_primary=is_primary, portal_id=portal_id,
+                    association_type=a_type, is_primary=is_primary,
                     created_at=now, updated_at=now, deleted_at=None,
                 )
                 db.add(new_row)
@@ -669,12 +667,11 @@ def _handle_association_change(
             ).first()
             if existing:
                 existing.is_primary = is_primary
-                existing.portal_id = portal_id
                 existing.updated_at = now
             else:
                 new_row = DealCompany(
                     deal_id=deal_id, company_id=company_id,
-                    association_type=a_type, is_primary=is_primary, portal_id=portal_id,
+                    association_type=a_type, is_primary=is_primary,
                     created_at=now, updated_at=now, deleted_at=None,
                 )
                 db.add(new_row)
@@ -734,9 +731,8 @@ def _upsert_deals(
                 hs_object_id=_get_prop(props, "hs_object_id") or deal_id,
                 createdate=_get_prop(props, "createdate"),
                 hs_lastmodifieddate=_get_prop(props, "hs_lastmodifieddate"),
-                portal_id=_get_prop(props, "portal_id"),
-                created_at=now, created_by=owner or change_source,
-                updated_at=now, updated_by=owner or change_source,
+                created_at=now,
+                updated_at=now,
                 is_active=True, deleted_at=None,
                 **new_values,
             )
@@ -753,7 +749,6 @@ def _upsert_deals(
             existing.hs_object_id = _get_prop(props, "hs_object_id") or deal_id
             existing.hs_lastmodifieddate = _get_prop(props, "hs_lastmodifieddate")
             existing.updated_at = now
-            existing.updated_by = owner or change_source
             existing.deleted_at = None
             existing.is_active = True
             for f, v in new_values.items():

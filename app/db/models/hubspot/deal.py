@@ -87,10 +87,8 @@ class Deal(Base):
         """Soft-delete this deal. Flush/commit after calling."""
         now = now_ist()
         self.deleted_at = now
-        self.deleted_by = by
         self.is_active = False
         self.updated_at = now
-        self.updated_by = by
 
     def __repr__(self) -> str:
         return (
