@@ -105,7 +105,6 @@ class LoadOrchestrator:
                 stage_map=stage_map,   
             )
 
-            self._progress.result_sample = enriched_deals[:3]
             self._progress.status = LoadStatus.COMPLETED
             self._result_data = {
                 "deals": all_deals,

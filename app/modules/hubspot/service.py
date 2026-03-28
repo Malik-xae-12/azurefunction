@@ -108,12 +108,11 @@ def _is_ignored_property(name: Optional[str]) -> bool:
 # WHO DID IT — resolve from webhook sourceId
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _parse_actor(event: HubSpotWebhookEvent) -> tuple[Optional[str], Optional[str]]:
+def _parse_actor(event: HubSpotWebhookEvent) -> Optional[str]:
     """
-    Returns (performed_by, performed_by_raw).
+    Returns performed_by.
 
-    performed_by     : HubSpot userId string e.g. "89164629", or None for system events
-    performed_by_raw : full raw sourceId string for traceability
+    performed_by : HubSpot userId string e.g. "89164629", or None for system events
 
     sourceId formats:
       "userId:89164629"                                → human user
@@ -122,10 +121,10 @@ def _parse_actor(event: HubSpotWebhookEvent) -> tuple[Optional[str], Optional[st
     """
     source_id: Optional[str] = getattr(event, "sourceId", None)
     if not source_id:
-        return None, None
+        return None
     if source_id.startswith("userId:"):
-        return source_id.split("userId:", 1)[1].strip(), source_id
-    return None, source_id
+        return source_id.split("userId:", 1)[1].strip()
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -139,11 +138,8 @@ def _write_audit(
     record_id: str,
     action: str,                          # human-readable e.g. "deal updated"
     changed_fields: Optional[Dict] = None,
-    deal_id: Optional[str] = None,
-    related_table: Optional[str] = None,
-    related_id: Optional[str] = None,
+    associated_record_id: Optional[str] = None,
     performed_by: Optional[str] = None,
-    performed_by_raw: Optional[str] = None,
     source: Optional[str] = None,
     hs_event_id: Optional[str] = None,
     hs_occurred_at: Optional[str] = None,
@@ -153,11 +149,8 @@ def _write_audit(
         record_id=str(record_id),
         action=action,
         changed_fields=json.dumps(changed_fields) if changed_fields else None,
-        deal_id=deal_id,
-        related_table=related_table,
-        related_id=related_id,
+        associated_record_id=associated_record_id,
         performed_by=performed_by,
-        performed_by_raw=performed_by_raw,
         source=source,
         hs_event_id=str(hs_event_id) if hs_event_id is not None else None,
         hs_occurred_at=str(hs_occurred_at) if hs_occurred_at is not None else None,
@@ -217,7 +210,6 @@ async def start_load(
                 progress.pages_processed = upd.pages_processed
                 progress.api_calls_made = upd.api_calls_made
                 progress.errors = upd.errors
-                progress.result_sample = upd.result_sample
 
                 db = SessionLocal()
                 try:
@@ -301,15 +293,24 @@ async def handle_webhook(events: List[HubSpotWebhookEvent], hubspot_token: str) 
         deduped.append(event)
     deduped.reverse()
 
+    # Sort so deal creation/propertyChange runs before associationChange,
+    # ensuring the "deal created" audit row is written before "contact linked" etc.
+    _EVENT_ORDER = {
+        "deal.deletion": 0,
+        "deal.creation": 1,
+        "deal.propertyChange": 2,
+        "deal.associationChange": 3,
+    }
+    deduped.sort(key=lambda e: _EVENT_ORDER.get(e.subscriptionType or "", 5))
+
     for event in deduped:
         try:
             object_id = str(event.objectId) if event.objectId is not None else ""
             sub_type = event.subscriptionType
-            performed_by, performed_by_raw = _parse_actor(event)
+            performed_by = _parse_actor(event)
 
             evt_kwargs = dict(
                 performed_by=performed_by,
-                performed_by_raw=performed_by_raw,
                 hs_event_id=getattr(event, "eventId", None),
                 hs_occurred_at=getattr(event, "occurredAt", None),
             )
@@ -455,7 +456,7 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
         )
     )
     _write_audit(db, table_name="deals", record_id=deal_id,
-                 action="deal deleted", deal_id=deal_id,
+                 action="deal deleted",
                  source="webhook_deletion", **evt_kwargs)
 
     # Cascade: close all active DealContact rows
@@ -467,8 +468,8 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
     ).scalars().all()
     for dc in active_contacts:
         _write_audit(db, table_name="deal_contacts", record_id=str(dc.id),
-                     action="contact removed", deal_id=deal_id,
-                     related_table="contacts", related_id=dc.contact_id,
+                     action="contact removed",
+                     associated_record_id=dc.contact_id,
                      source="deal_deleted", **evt_kwargs)
     if active_contacts:
         db.execute(
@@ -486,8 +487,8 @@ def _soft_delete_deal(db: Session, deal_id: str, evt_kwargs: Optional[Dict] = No
     ).scalars().all()
     for dc in active_companies:
         _write_audit(db, table_name="deal_companies", record_id=str(dc.id),
-                     action="company removed", deal_id=deal_id,
-                     related_table="companies", related_id=dc.company_id,
+                     action="company removed",
+                     associated_record_id=dc.company_id,
                      source="deal_deleted", **evt_kwargs)
     if active_companies:
         db.execute(
@@ -598,7 +599,7 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_contacts", record_id=str(row.id),
                     action="contact removed",
-                    deal_id=deal_id, related_table="contacts", related_id=contact_id,
+                    associated_record_id=contact_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
             db.execute(
@@ -628,7 +629,7 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_contacts", record_id=str(new_row.id),
                     action="contact linked",
-                    deal_id=deal_id, related_table="contacts", related_id=contact_id,
+                    associated_record_id=contact_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
 
@@ -649,7 +650,7 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_companies", record_id=str(row.id),
                     action="company removed",
-                    deal_id=deal_id, related_table="companies", related_id=company_id,
+                    associated_record_id=company_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
             db.execute(
@@ -679,7 +680,7 @@ def _handle_association_change(
                 _write_audit(
                     db, table_name="deal_companies", record_id=str(new_row.id),
                     action="company linked",
-                    deal_id=deal_id, related_table="companies", related_id=company_id,
+                    associated_record_id=company_id,
                     source="webhook_assoc", **evt_kwargs,
                 )
 
@@ -741,8 +742,7 @@ def _upsert_deals(
             _write_audit(
                 db, table_name="deals", record_id=deal_id,
                 action="deal created",
-                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
-                deal_id=deal_id, source=change_source, **evt_kwargs,
+                source=change_source, **evt_kwargs,
             )
         else:
             diff = _diff_fields(existing, new_values, _DEAL_AUDIT_FIELDS)
@@ -757,7 +757,7 @@ def _upsert_deals(
                 _write_audit(
                     db, table_name="deals", record_id=deal_id,
                     action="deal updated",
-                    changed_fields=diff, deal_id=deal_id,
+                    changed_fields=diff,
                     source=change_source, **evt_kwargs,
                 )
 
@@ -810,7 +810,6 @@ def _upsert_contacts(
             _write_audit(
                 db, table_name="contacts", record_id=cid,
                 action="contact created",
-                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
                 source=change_source, **evt_kwargs,
             )
         else:
@@ -839,7 +838,7 @@ def _upsert_contacts(
                         db, table_name="deal_contacts", record_id=str(dc.id),
                         action="contact updated",
                         changed_fields=diff,
-                        deal_id=dc.deal_id, related_table="contacts", related_id=cid,
+                        associated_record_id=cid,
                         source=change_source, **evt_kwargs,
                     )
 
@@ -896,7 +895,6 @@ def _upsert_companies(
             _write_audit(
                 db, table_name="companies", record_id=cid,
                 action="company created",
-                changed_fields={k: {"old": None, "new": v} for k, v in new_values.items() if v is not None},
                 source=change_source, **evt_kwargs,
             )
         else:
@@ -923,7 +921,7 @@ def _upsert_companies(
                         db, table_name="deal_companies", record_id=str(dc.id),
                         action="company updated",
                         changed_fields=diff,
-                        deal_id=dc.deal_id, related_table="companies", related_id=cid,
+                        associated_record_id=cid,
                         source=change_source, **evt_kwargs,
                     )
 
@@ -966,8 +964,8 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
             row.deleted_at = now
             row.updated_at = now
             _write_audit(db, table_name="deal_contacts", record_id=str(row.id),
-                         action="contact removed", deal_id=str(deal_id),
-                         related_table="contacts", related_id=contact_id,
+                         action="contact removed",
+                         associated_record_id=contact_id,
                          source="initial_load_replace")
 
         for contact_id in incoming:
@@ -982,8 +980,8 @@ def _replace_deal_contacts(db: Session, contact_assoc: Dict[str, List[str]]) -> 
                 db.add(new_row)
                 db.flush()
                 _write_audit(db, table_name="deal_contacts", record_id=str(new_row.id),
-                             action="contact linked", deal_id=str(deal_id),
-                             related_table="contacts", related_id=contact_id,
+                             action="contact linked",
+                             associated_record_id=contact_id,
                              source="initial_load")
 
 
@@ -1002,8 +1000,8 @@ def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) ->
             row.deleted_at = now
             row.updated_at = now
             _write_audit(db, table_name="deal_companies", record_id=str(row.id),
-                         action="company removed", deal_id=str(deal_id),
-                         related_table="companies", related_id=company_id,
+                         action="company removed",
+                         associated_record_id=company_id,
                          source="initial_load_replace")
 
         for company_id in incoming:
@@ -1018,8 +1016,8 @@ def _replace_deal_companies(db: Session, company_assoc: Dict[str, List[str]]) ->
                 db.add(new_row)
                 db.flush()
                 _write_audit(db, table_name="deal_companies", record_id=str(new_row.id),
-                             action="company linked", deal_id=str(deal_id),
-                             related_table="companies", related_id=company_id,
+                             action="company linked",
+                             associated_record_id=company_id,
                              source="initial_load")
 
 
@@ -1110,7 +1108,6 @@ def update_job_from_progress(db: Session, job_id: str, progress: LoadProgress) -
     job.api_calls_made = progress.api_calls_made
     job.error = progress.error
     job.errors_json = json.dumps(progress.errors)
-    job.result_sample_json = json.dumps(progress.result_sample)
     if progress.completed_at:
         from datetime import datetime
         job.completed_at = datetime.fromisoformat(progress.completed_at)

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,10 +30,6 @@ class LoadProgress(BaseModel):
     error: Optional[str] = None
     started_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     completed_at: Optional[str] = None
-    result_sample: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="First 3 enriched deals as a preview",
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

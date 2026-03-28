@@ -3,7 +3,6 @@
 from datetime import datetime
 
 from sqlalchemy import Column, DateTime, Integer, String, Text
-from sqlalchemy.sql import func
 
 from app.db.base import Base
 
@@ -24,11 +23,9 @@ class Job(Base):
 
     error = Column(Text, nullable=True)
     errors_json = Column(Text, nullable=True, comment="JSON array of non-fatal error strings")
-    result_sample_json = Column(Text, nullable=True, comment="JSON array — first 3 deals preview")
 
     started_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
-    synced_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
 
     def __repr__(self) -> str:
         return f"<Job job_id={self.job_id!r} status={self.status!r}>"
