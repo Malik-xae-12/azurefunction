@@ -16,7 +16,6 @@ class Deal(Base):
 
     # ── HubSpot identity ──────────────────────────────────────────────────────
     hs_object_id = Column(String(64), nullable=True, index=True)
-    portal_id = Column(String(32), nullable=True, comment="HubSpot portal / account ID")
 
     # ── Core deal fields ──────────────────────────────────────────────────────
     dealname = Column(String(512), nullable=True)
@@ -48,11 +47,6 @@ class Deal(Base):
         server_default=func.now(),
         comment="When this row was first inserted (IST)",
     )
-    created_by = Column(
-        String(64),
-        nullable=True,
-        comment="hubspot_owner_id at creation, or system source (e.g. 'initial_load')",
-    )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -61,20 +55,10 @@ class Deal(Base):
         server_default=func.now(),
         comment="Last time this row was modified (IST)",
     )
-    updated_by = Column(
-        String(64),
-        nullable=True,
-        comment="hubspot_owner_id or system source that last updated this row",
-    )
     deleted_at = Column(
         DateTime(timezone=True),
         nullable=True,
         comment="Soft-delete timestamp (IST); NULL = deal is active",
-    )
-    deleted_by = Column(
-        String(64),
-        nullable=True,
-        comment="hubspot_owner_id or system source that triggered the deletion",
     )
     is_active = Column(
         Boolean,

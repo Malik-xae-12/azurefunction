@@ -34,7 +34,6 @@ class DealContact(Base):
     contact_id = Column(String(64), nullable=False, comment="HubSpot contact ID")
     association_type = Column(String(128), nullable=True, comment="DEAL_TO_CONTACT")
     is_primary = Column(Boolean, nullable=True, default=False)
-    portal_id = Column(String(32), nullable=True)
 
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=now_ist,
@@ -94,7 +93,6 @@ class DealCompany(Base):
     company_id = Column(String(64), nullable=False, comment="HubSpot company ID")
     association_type = Column(String(128), nullable=True, comment="DEAL_TO_COMPANY")
     is_primary = Column(Boolean, nullable=True, default=False)
-    portal_id = Column(String(32), nullable=True)
 
     created_at = Column(
         DateTime(timezone=True), nullable=False, default=now_ist,
